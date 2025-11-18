@@ -1,10 +1,11 @@
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from functools import partial
-from itertools import count, permutations
+from itertools import permutations
 from math import factorial
 from typing import Any
 
+from ordered_set import OrderedSet
 from scipy.sparse import lil_array
 import numpy as np
 
@@ -255,13 +256,11 @@ class NormalFormGame(Serializable, Game):
 
     actions: Any
     utilities: Any
-    indices: Any = field(init=False, default_factory=list)
 
     def __post_init__(self):
         super().__post_init__()
 
-        for i, actions in enumerate(self.actions):
-            self.indices.append(dict(zip(actions, count())))
+        self.actions = tuple(map(OrderedSet, self.actions))
 
     def _verify(self, *, utilities_shape=None, **kwargs):
         super()._verify(**kwargs)
@@ -303,14 +302,6 @@ class TwoPlayerNormalFormGame(TwoPlayerGame, NormalFormGame):
     @property
     def column_actions(self):
         return self.actions[1]
-
-    @property
-    def row_indices(self):
-        return self.indices[0]
-
-    @property
-    def column_indices(self):
-        return self.indices[1]
 
     @property
     def row_utilities(self):
@@ -414,7 +405,7 @@ class TwoPlayerExtensiveFormGame(TwoPlayerGame, ExtensiveFormGame):
             for tfsdp, sequence in zip(tfsdps, raw_utility['sequences']):
                 sequence = tuple(sequence)
 
-                indices.append(tfsdp.indices[sequence])
+                indices.append(tfsdp.sequences.index(sequence))
 
             indices = tuple(indices)
             row_utilities[indices] = raw_utility['values'][0]
@@ -447,14 +438,6 @@ class TwoPlayerExtensiveFormGame(TwoPlayerGame, ExtensiveFormGame):
     @property
     def column_sequences(self):
         return self.column_tree_form_sequential_decision_process.sequences
-
-    @property
-    def row_indices(self):
-        return self.row_tree_form_sequential_decision_process.indices
-
-    @property
-    def column_indices(self):
-        return self.column_tree_form_sequential_decision_process.indices
 
     @property
     def row_utilities(self):
@@ -530,7 +513,7 @@ class TwoPlayerZeroSumExtensiveFormGame(
             for tfsdp, sequence in zip(tfsdps, raw_utility['sequences']):
                 sequence = tuple(sequence)
 
-                indices.append(tfsdp.indices[sequence])
+                indices.append(tfsdp.sequences.index(sequence))
 
             indices = tuple(indices)
             utilities[indices] = raw_utility['value']

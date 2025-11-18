@@ -153,7 +153,6 @@ class TreeFormSequentialDecisionProcess(Serializable):
     decision_points: Any = field(init=False, default_factory=OrderedSet)
     observation_points: Any = field(init=False, default_factory=OrderedSet)
     sequences: Any = field(init=False, default_factory=OrderedSet)
-    indices: Any = field(init=False, default_factory=dict)
     parent_sequences: Any = field(init=False, default_factory=dict)
     actions: Any = field(
         init=False,
@@ -203,8 +202,6 @@ class TreeFormSequentialDecisionProcess(Serializable):
             if is_sequence:
                 self.sequences.add(parent_edge)
 
-                self.indices[parent_edge] = len(self.indices)
-
             self.parent_sequences[p] = parent_sequence
 
     def behavioral_uniform_strategy(self):
@@ -227,7 +224,7 @@ class TreeFormSequentialDecisionProcess(Serializable):
 
                     for i, a in enumerate(self.actions[p]):
                         value = (
-                            utility[self.indices[p, a]]
+                            utility[self.sequences.index((p, a))]
                             + V[self.transitions[p, a]]
                         )
 
@@ -250,15 +247,15 @@ class TreeFormSequentialDecisionProcess(Serializable):
 
     def behavioral_to_sequence_form(self, behavioral_strategy):
         strategy = np.zeros(len(self.sequences))
-        strategy[self.indices[()]] = 1
+        strategy[self.sequences.index(())] = 1
 
         for j in self.decision_points:
             p_j = self.parent_sequences[j]
 
             for i, a in enumerate(self.actions[j]):
-                strategy[self.indices[j, a]] = (
+                strategy[self.sequences.index((j, a))] = (
                     behavioral_strategy[j][i]
-                    * strategy[self.indices[p_j]]
+                    * strategy[self.sequences.index(p_j)]
                 )
 
         return strategy
@@ -273,7 +270,7 @@ class TreeFormSequentialDecisionProcess(Serializable):
                         V[p] += (
                             behavioral_strategy[p][i]
                             * (
-                                utility[self.indices[p, a]]
+                                utility[self.sequences.index((p, a))]
                                 + V[self.transitions[p, a]]
                             )
                         )
@@ -288,7 +285,7 @@ class TreeFormSequentialDecisionProcess(Serializable):
 
             for i, a in enumerate(self.actions[j]):
                 utilities[j][i] = (
-                    utility[self.indices[j, a]]
+                    utility[self.sequences.index((j, a))]
                     + V[self.transitions[j, a]]
                 )
 
