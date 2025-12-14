@@ -6,6 +6,7 @@ from functools import partial
 from importlib import import_module
 from json import dump, dumps, load, loads
 from math import inf
+from random import choices
 from typing import Any
 
 from ordered_set import OrderedSet
@@ -90,6 +91,10 @@ def split(values, counts):
         begin = end
 
     return splits
+
+
+def sample(values, probabilities):
+    return choices(values, probabilities)[0]
 
 
 class Serializable(ABC):

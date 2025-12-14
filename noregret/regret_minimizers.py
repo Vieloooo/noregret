@@ -10,6 +10,7 @@ import numpy as np
 
 from noregret.utilities import (
     euclidean_projection_on_probability_simplex,
+    sample,
     split,
     stationary_distribution,
 )
@@ -51,6 +52,9 @@ class RegretMinimizer(ABC):
     @abstractmethod
     def next_strategy(self, prediction=False):
         pass
+
+    def undo_next_strategy(self):
+        self.strategies.pop()
 
     def observe_utility(self, utility):
         if len(self.strategies) == len(self.utilities):
@@ -390,6 +394,9 @@ class BlumMansour(ProbabilitySimplexSwapRegretMinimizer):
 
         return strategy
 
+    def undo_next_strategy(self):
+        raise NotImplementedError
+
     def observe_utility(self, utility):
         super().observe_utility(utility)
 
@@ -470,6 +477,9 @@ class CounterfactualRegretMinimization(SequenceFormPolytopeRegretMinimizer):
         self.strategies.append(strategy)
 
         return strategy
+
+    def undo_next_strategy(self):
+        raise NotImplementedError
 
     def observe_utility(self, utility):
         super().observe_utility(utility)
@@ -568,6 +578,9 @@ class CartesianProductRegretCircuit(RegretCircuit):
 
         return strategy
 
+    def undo_next_strategy(self):
+        raise NotImplementedError
+
     def observe_utility(self, utility):
         super().observe_utility(utility)
 
@@ -634,6 +647,9 @@ class ConvexHullRegretCircuit(RegretCircuit):
 
         return strategy
 
+    def undo_next_strategy(self):
+        raise NotImplementedError
+
     def observe_utility(self, utility):
         super().observe_utility(utility)
 
@@ -643,3 +659,152 @@ class ConvexHullRegretCircuit(RegretCircuit):
         self.previous_outputs = self.outputs.copy()
 
         self.mixing_regret_minimizer.observe_utility(self.outputs @ utility)
+
+
+@dataclass
+class StochasticRegretMinimization(ABC):
+    """Stochastic regret minimization."""
+
+    extensive_form_game: Any
+
+    @property
+    def average_strategy_profile(self):
+        return lambda state: (
+            self._local_regret_minimizer(state).average_strategy
+        )
+
+    @abstractmethod
+    def _local_regret_minimizer(self, state):
+        pass
+
+    def external_sampling(self):
+        for player in self.extensive_form_game.players:
+            self._external_sampling(
+                player,
+                self.extensive_form_game.initial_state,
+            )
+
+    def _external_sampling(self, player, state):
+        if state.is_terminal():
+            utility = state.utility(player)
+        elif state.is_chance():
+            actions, probabilities = zip(*state.chance_action_probabilities)
+            action = sample(actions, probabilities)
+            utility = self._external_sampling(player, state.apply(action))
+        else:
+            local_regret_minimizer = self._local_regret_minimizer(state)
+            actions = state.actions
+            probabilities = local_regret_minimizer.next_strategy()
+
+            if state.player == player:
+                utilities = list(
+                    map(
+                        partial(self._external_sampling, player),
+                        map(state.apply, actions),
+                    ),
+                )
+                utility = utilities @ probabilities
+
+                local_regret_minimizer.observe_utility(utilities)
+            else:
+                action = sample(actions, probabilities)
+                utility = self._external_sampling(player, state.apply(action))
+
+                local_regret_minimizer.undo_next_strategy()
+
+        return utility
+
+    def outcome_sampling(self, reference_strategy_profile):
+        for player in self.extensive_form_game.players:
+            self._outcome_sampling(
+                reference_strategy_profile,
+                player,
+                self.extensive_form_game.initial_state,
+                1,
+            )
+
+    def _outcome_sampling(
+            self,
+            reference_strategy_profile,
+            player,
+            state,
+            reference_reach_probability,
+    ):
+        if state.is_terminal():
+            utility = state.utility(player) / reference_reach_probability
+        elif state.is_chance():
+            actions, probabilities = zip(*state.chance_action_probabilities)
+            action = sample(actions, probabilities)
+            utility = self._outcome_sampling(
+                reference_strategy_profile,
+                player,
+                state.apply(action),
+                reference_reach_probability,
+            )
+        else:
+            local_regret_minimizer = self._local_regret_minimizer(state)
+            actions = state.actions
+
+            if state.player == player:
+                probabilities = reference_strategy_profile(state)
+                index = sample(range(len(actions)), probabilities)
+                action = actions[index]
+                probability = probabilities[index]
+                utility = (
+                    probability
+                    * self._outcome_sampling(
+                        reference_strategy_profile,
+                        player,
+                        state.apply(action),
+                        probability * reference_reach_probability,
+                    )
+                )
+                utilities = np.zeros(len(actions))
+                utilities[index] = utility
+
+                local_regret_minimizer.next_strategy()
+                local_regret_minimizer.observe_utility(utilities)
+            else:
+                probabilities = local_regret_minimizer.next_strategy()
+                action = sample(actions, probabilities)
+                utility = self._outcome_sampling(
+                    reference_strategy_profile,
+                    player,
+                    state.apply(action),
+                    reference_reach_probability,
+                )
+
+                local_regret_minimizer.undo_next_strategy()
+
+        return utility
+
+
+@dataclass
+class MonteCarloCounterfactualRegretMinimization(StochasticRegretMinimization):
+    """Monte Carlo Counterfactual regret minimization (MCCFR)."""
+
+    regret_minimizer_factory: Any = partial(
+        RegretMatching,
+        is_time_symmetric=True,
+    )
+    _: KW_ONLY
+    local_regret_minimizers: Any = field(init=False, default_factory=dict)
+
+    @property
+    def iteration_count(self):
+        iteration_count = 0
+
+        for R in self.local_regret_minimizers.values():
+            iteration_count += R.iteration_count
+
+        return iteration_count
+
+    def _local_regret_minimizer(self, state):
+        if state.infoset in self.local_regret_minimizers:
+            R = self.local_regret_minimizers[state.infoset]
+        else:
+            action_count = len(state.actions)
+            R = self.regret_minimizer_factory(action_count)
+            self.local_regret_minimizers[state.infoset] = R
+
+        return R

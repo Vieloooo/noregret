@@ -1,6 +1,7 @@
 from abc import ABC, abstractmethod
+from collections import defaultdict
 from dataclasses import dataclass
-from functools import partial
+from functools import cache, partial
 from itertools import permutations
 from math import factorial
 from typing import Any
@@ -73,8 +74,11 @@ class Game(ABC):
 
         for i, value in enumerate(self.values(*strategies)):
             opponent_strategies = strategies[:i] + strategies[i + 1:]
-            _, br_value = self.best_response(i, *opponent_strategies)
-            gap += br_value - value
+            _, best_response_value = self.best_response(
+                i,
+                *opponent_strategies,
+            )
+            gap += best_response_value - value
 
         return gap
 
@@ -86,8 +90,11 @@ class Game(ABC):
             average_opponent_strategies = (
                 average_strategies[:i] + average_strategies[i + 1:]
             )
-            _, br_value = self.best_response(i, *average_opponent_strategies)
-            gap += br_value - value
+            _, best_response_value = self.best_response(
+                i,
+                *average_opponent_strategies,
+            )
+            gap += best_response_value - value
 
         return gap
 
@@ -613,3 +620,169 @@ class SymmetrizedGame(Game):
 
     def best_response(self, player, *opponent_strategies):
         raise NotImplementedError
+
+
+class ExtensiveFormGame2(ABC):
+    """Extensive-form game (EFG)."""
+
+    @dataclass(frozen=True)
+    class State:
+        """State of an extensive-form game."""
+
+        @property
+        @abstractmethod
+        def utilities(self):
+            pass
+
+        @property
+        @abstractmethod
+        def chance_action_probabilities(self):
+            pass
+
+        @property
+        @abstractmethod
+        def actions(self):
+            pass
+
+        @property
+        @abstractmethod
+        def infoset(self):
+            pass
+
+        @property
+        @abstractmethod
+        def player(self):
+            pass
+
+        @abstractmethod
+        def is_terminal(self):
+            pass
+
+        @abstractmethod
+        def is_chance(self):
+            pass
+
+        @abstractmethod
+        def utility(self, player):
+            pass
+
+        @abstractmethod
+        def apply(self, action):
+            pass
+
+    @property
+    @abstractmethod
+    def players(self):
+        pass
+
+    @property
+    @abstractmethod
+    def initial_state(self):
+        pass
+
+    def values(self, strategy_profile, state=None):
+        if state is None:
+            values = self.values(strategy_profile, self.initial_state)
+        elif state.is_terminal():
+            values = state.utilities
+        else:
+            if state.is_chance():
+                actions, probabilities = zip(
+                    *state.chance_action_probabilities,
+                )
+            else:
+                actions = state.actions
+                probabilities = strategy_profile(state)
+
+            values = 0
+
+            for action, probability in zip(actions, probabilities):
+                values += (
+                    probability
+                    * self.values(strategy_profile, state.apply(action))
+                )
+
+        return values
+
+    def best_response_value(self, player, strategy_profile):
+        states = defaultdict(list)
+        counterfactual_reach_probabilities = {}
+
+        def dfs(state, counterfactual_reach_probability):
+            counterfactual_reach_probabilities[state] = (
+                counterfactual_reach_probability
+            )
+
+            if state.is_terminal():
+                return
+
+            if not state.is_chance():
+                states[state.infoset].append(state)
+
+            if state.is_chance() or state.player != player:
+                if state.is_chance():
+                    actions, probabilities = zip(
+                        *state.chance_action_probabilities,
+                    )
+                else:
+                    actions = state.actions
+                    probabilities = strategy_profile(state)
+
+                for action, probability in zip(actions, probabilities):
+                    dfs(
+                        state.apply(action),
+                        probability * counterfactual_reach_probability,
+                    )
+            else:
+                for action in state.actions:
+                    dfs(state.apply(action), counterfactual_reach_probability)
+
+        dfs(self.initial_state, 1)
+
+        @cache
+        def solve(state):
+            if state.is_terminal():
+                value = state.utility(player)
+            elif state.is_chance() or state.player != player:
+                if state.is_chance():
+                    actions, probabilities = zip(
+                        *state.chance_action_probabilities,
+                    )
+                else:
+                    actions = state.actions
+                    probabilities = strategy_profile(state)
+
+                value = 0
+
+                for action, probability in zip(actions, probabilities):
+                    value += probability * solve(state.apply(action))
+            else:
+                value = solve2(state.infoset)
+
+            return value
+
+        @cache
+        def solve2(infoset):
+            values = defaultdict(int)
+
+            for state in states[infoset]:
+                weight = counterfactual_reach_probabilities[state]
+
+                for i, action in enumerate(state.actions):
+                    values[i] += weight * solve(state.apply(action))
+
+            return max(values.values())
+
+        return solve(self.initial_state)
+
+    def nash_gap(self, strategy_profile):
+        gap = 0
+
+        for player, value in zip(self.players, self.values(strategy_profile)):
+            best_response_value = self.best_response_value(
+                player,
+                strategy_profile,
+            )
+            gap += best_response_value - value
+
+        return gap
