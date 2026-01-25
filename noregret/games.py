@@ -367,6 +367,7 @@ class ExtensiveFormGame(Serializable, Game):
     def deserialize(cls, raw_data):
         raise NotImplementedError
 
+    # A list of TFSDP here, one for each player. 
     tree_form_sequential_decision_processes: Any
     utilities: Any
 
