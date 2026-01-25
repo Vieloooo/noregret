@@ -428,62 +428,73 @@ class CounterfactualRegretMinimization(SequenceFormPolytopeRegretMinimizer):
     local_regret_minimizers: Any = None
 
     def __post_init__(self):
-        tfsdp = self.tree_form_sequential_decision_process
-        self.dimension = len(tfsdp.sequences)
+        tfsdp = self.tree_form_sequential_decision_process  # 该玩家的 TFSDP（信息集/动作/序列边的树表示）
+        self.dimension = len(tfsdp.sequences)  # 序列形式（sequence-form）策略向量维度 = 序列边数量（含 root 空序列）
 
-        super().__post_init__()
+        super().__post_init__()  # 初始化基类的序列形式 regret minimizer 记录（平均策略、累计效用等）
 
-        self.behavioral_strategy = tfsdp.behavioral_uniform_strategy()
+        self.behavioral_strategy = tfsdp.behavioral_uniform_strategy()  # 初始化为行为策略的均匀分布：每个信息集动作等概率
 
-        if self.previous_behavioral_strategy is None:
+        if self.previous_behavioral_strategy is None:  # 保存“上一轮”的行为策略（用于 optimistic/prediction 变体）
             self.previous_behavioral_strategy = self.behavioral_strategy.copy()
 
-        if self.local_regret_minimizers is None:
+        if self.local_regret_minimizers is None:  # 为每个信息集/决策点创建一个“局部”regret minimizer
             if self.regret_minimizer_factory is None:
                 raise ValueError('regret minimizer factory not set')
 
+            # CFR 的关键：把大博弈分解成许多局部 simplex 优化问题。
+            # 对每个决策点 j，局部算法只需要处理 |A(j)| 维的动作分布。
             self.local_regret_minimizers = {
-                j: self.regret_minimizer_factory(len(tfsdp.actions[j]))
+                j: self.regret_minimizer_factory(len(tfsdp.actions[j]))  # 例如 RegretMatching(|A(j)|)
                 for j in tfsdp.decision_points
             }
 
     def next_strategy(self, prediction=False):
-        self.behavioral_strategy = {}
+        self.behavioral_strategy = {}  # 本轮输出的行为策略：j -> 概率向量 π(·|j)
 
         if prediction is False or prediction is True:
+            # 常规路径：每个信息集的局部算法直接产出 π(·|j)
+            # prediction=False：不使用预测；prediction=True：使用局部算法自身的默认预测（通常是 previous_utility）
             for j, R in self.local_regret_minimizers.items():
                 self.behavioral_strategy[j] = R.next_strategy(prediction)
         else:
+            # optimistic / predictive CFR 路径：prediction 不是 bool，而是一条“序列边效用”向量
+            # 我们需要把它从 sequence-form 的边效用，映射成每个信息集动作的 Q 预测值。
             counterfactual_predictions = (
                 self
                 .tree_form_sequential_decision_process
                 .counterfactual_utilities(
-                    self.previous_behavioral_strategy,
-                    prediction,
+                    self.previous_behavioral_strategy,  # 用上一轮行为策略 π^{t-1}
+                    prediction,  # 预测的边效用 û(σ)
                 )
-            )
+            )  # 得到：对每个信息集 j，预测的 Q̂(j,·)
 
             for j, R in self.local_regret_minimizers.items():
+                # 把该信息集的动作级预测 Q̂(j,·) 交给局部算法，产生下一步策略
                 self.behavioral_strategy[j] = R.next_strategy(
                     counterfactual_predictions[j],
                 )
 
+        # 将行为策略 π(·|j) 转为序列形式 realization plan x(σ)
+        # x(())=1，且对每条序列边 (j,a)：x(j,a)=π(a|j)*x(parent_seq(j))
         strategy = (
             self
             .tree_form_sequential_decision_process
             .behavioral_to_sequence_form(self.behavioral_strategy)
         )
 
-        self.strategies.append(strategy)
+        self.strategies.append(strategy)  # 记录本轮输出的序列形式策略（供平均/日志等用途）
 
-        return strategy
+        return strategy  # 返回给上层（例如对偶更新或博弈求解外层）
 
     def undo_next_strategy(self):
         raise NotImplementedError
 
     def observe_utility(self, utility):
-        super().observe_utility(utility)
+        super().observe_utility(utility)  # 记录本轮收到的“序列边效用”向量 u(σ)
 
+        # 关键：把全局的边效用 u(σ) + 当前行为策略 π，变成每个信息集的动作价值 Q(j,·)
+        # TFSDP.counterfactual_utilities 计算：Q(j,a)=u(j,a)+V(next(j,a))，其中 V 按 π 自底向上汇总
         counterfactual_utilities = (
             self
             .tree_form_sequential_decision_process
@@ -491,9 +502,11 @@ class CounterfactualRegretMinimization(SequenceFormPolytopeRegretMinimizer):
         )
 
         for j, R in self.local_regret_minimizers.items():
+            # 将信息集 j 的动作价值向量喂给局部 regret minimizer
+            # 局部算法内部会形成即时遗憾 r(j,a)=Q(j,a)-E_{a'~π}[Q(j,a')] 并累积
             R.observe_utility(counterfactual_utilities[j])
 
-        self.previous_behavioral_strategy = self.behavioral_strategy.copy()
+        self.previous_behavioral_strategy = self.behavioral_strategy.copy()  # 为下一轮 prediction 路径缓存 π^{t}
 
 
 @dataclass
@@ -520,6 +533,8 @@ class DiscountedCounterfactualRegretMinimization(
 
     def __post_init__(self):
         if self.regret_minimizer_factory is None:
+            # DCFR：把“折扣”逻辑注入到局部 regret matching（对正/负遗憾分别折扣）
+            # 这里用 partial 固定参数，仍保持“每个信息集一个局部算法”的 CFR 结构。
             self.regret_minimizer_factory = partial(
                 DiscountedRegretMatching,
                 alpha=self.alpha,
@@ -527,7 +542,7 @@ class DiscountedCounterfactualRegretMinimization(
                 gamma=self.gamma,
             )
 
-        super().__post_init__()
+        super().__post_init__()  # 继续复用 CFR 的初始化流程（创建 local_regret_minimizers 等）
 
 
 @dataclass

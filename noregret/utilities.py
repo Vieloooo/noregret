@@ -130,6 +130,23 @@ class Serializable(ABC):
 
 @dataclass
 class TreeFormSequentialDecisionProcess(Serializable):
+    """Tree-Form Sequential Decision Process (TFSDP).
+
+    这是一种把“带信息集的不完全信息/部分可观测顺序决策”抽象成树结构的表示。
+    在 CFR（Counterfactual Regret Minimization）/序列形式（sequence form）里，
+    我们经常需要：
+
+    - 在**决策点**（decision point，类似信息集 $I$）上列出可选动作 $a \in A(I)$；
+    - 在**观测点**（observation point）上把不可控的信号/观测 $s$ 汇总成分支；
+    - 把“到达某个信息集并采取某动作”编码为一个**序列**（sequence）边 $(I,a)$，
+        从而把策略表示成序列权重 $x(\sigma)$。
+
+    本类的核心用途：
+    1) 在树上做动态规划，计算最优回应（best response）；
+    2) 给定一个行为策略（behavioral strategy）$\pi$，计算每个决策点的
+            反事实/局部 Q 值（counterfactual utilities），供 CFR 更新遗憾值。
+    """
+
     class NodeType(IntEnum):
         DECISION_POINT = auto()
         OBSERVATION_POINT = auto()
@@ -171,6 +188,19 @@ class TreeFormSequentialDecisionProcess(Serializable):
     )
 
     def __post_init__(self):
+        """在 TFSDP 原始转移 `transitions` 基础上派生出各种索引结构。
+
+        这一步的作用类似：把一棵“历史-动作”树整理成 CFR/序列形式需要的数据结构。
+
+        - `self.sequences`：收集所有“序列边”（root 也视为一个空序列 `()`）。
+            对 CFR 来说，序列 $\sigma=(I,a)$ 表示“到达信息集 $I$ 后选择动作 $a$”。
+        - `self.parent_sequences[p]`：每个节点对应的父序列（用于把行为策略转为序列策略）。
+        - `self.actions[j]`：每个决策点/信息集 $j$ 的动作集合 $A(j)$。
+        - `self.signals[p]`：观测点上的信号集合（不可控分支，类似公共/私有观测）。
+
+        注意：这里的 parent_edge 形如 `(parent_node, event)`；
+        对决策点来说 event 是动作；对观测点来说 event 是信号。
+        """
         self.nodes.update(self.transitions.values())
 
         for parent_edge, p in self.transitions.items():
@@ -220,32 +250,63 @@ class TreeFormSequentialDecisionProcess(Serializable):
         return strategy
 
     def behavioral_best_response(self, utility):
-        strategy = {}
-        V = defaultdict(int)
+        """给定“边上的即时效用” `utility`，计算行为策略意义下的最优回应。
 
-        for p in reversed(self.nodes):
-            match self.node_types[p]:
+        这在 CFR 里对应：
+        - 在固定其他玩家策略与机会分布后，求某个玩家的 best response（用于 exploitability
+            或者某些变体里的外层循环）。
+
+        这里 `utility[k]` 表示序列边（self.sequences 的第 k 个）对应的即时收益
+        $u(\sigma)$。对一个决策点（信息集）$I$，最优回应满足 Bellman 形式：
+
+        $$
+        V(I) = \max_{a\in A(I)} \bigl(u(I,a) + V(\text{next}(I,a))\bigr).
+        $$
+
+        对观测点 $O$（不可控信号分支），这里采用“把所有信号分支相加”的结构：
+
+        $$
+        V(O) = \sum_{s\in S(O)} V(\text{next}(O,s)).
+        $$
+
+        这等价于把观测点看作“确定会展开的并行分支/信息集切分”；在很多实现中，
+        机会节点会用期望 $\sum_s p(s)V(\cdot)$，而此 TFSDP 把概率通常吸收到 `utility`
+        或图结构里，所以这里直接求和。
+
+        :param utility: shape = (#sequences,) 的向量，按 `self.sequences` 索引。
+        :return: (behavioral_strategy, root_value)
+            - behavioral_strategy[j] 是在决策点 j 的 one-hot 最优动作。
+            - root_value 是从根节点开始的最优价值。
+        """
+        strategy = {}  # 最优回应的行为策略：每个决策点 j -> 一个 one-hot 分布（选中的动作概率为 1）
+        V = defaultdict(int)  # 价值函数 V[p]：从节点 p 往后、在“最优回应/确定性展开规则”下的累积价值
+
+        for p in reversed(self.nodes):  # 自底向上（逆拓扑）做动态规划；保证 children 的 V 已经算好
+            match self.node_types[p]:  # 根据节点类型分别处理
                 case self.NodeType.DECISION_POINT:
-                    V[p] = -inf
-                    index = None
+                    V[p] = -inf  # 决策点取 max：先把当前最优值初始化成负无穷
+                    index = None  # 记录使 V[p] 达到最大值的动作索引 i（对应 self.actions[p] 的枚举顺序）
 
-                    for i, a in enumerate(self.actions[p]):
+                    for i, a in enumerate(self.actions[p]):  # 枚举该信息集/决策点 p 的每个动作 a
+                        # 这行对应 Bellman 里的 Q 值：Q(p,a) = u(p,a) + V(next(p,a))
                         value = (
-                            utility[self.sequences.index((p, a))]
-                            + V[self.transitions[p, a]]
+                            utility[self.sequences.index((p, a))]  # u(p,a)：该序列边 (p,a) 的即时收益
+                            + V[self.transitions[p, a]]  # 续行价值：走到 child 节点后的最优价值 V[next]
                         )
 
-                        if V[p] < value:
+                        if V[p] < value:  # 如果该动作更优，就更新最优值与 argmax
                             V[p] = value
                             index = i
 
-                    strategy[p] = np.zeros(len(self.actions[p]))
-                    strategy[p][index] = 1
+                    strategy[p] = np.zeros(len(self.actions[p]))  # one-hot：默认都不选
+                    strategy[p][index] = 1  # 把最优动作对应位置置 1（确定性最优回应）
                 case self.NodeType.OBSERVATION_POINT:
-                    for s in self.signals[p]:
-                        V[p] += V[self.transitions[p, s]]
+                    # 观测点没有“我方决策”，表示观测/信号导致的信息集切分。
+                    # 这里按 TFSDP 的约定将所有信号分支的价值相加：V(p)=sum_s V(next(p,s))
+                    for s in self.signals[p]:  # 枚举所有可能信号 s
+                        V[p] += V[self.transitions[p, s]]  # 把每个信号分支的续行价值累加
 
-        return strategy, V[self.nodes[0]]
+        return strategy, V[self.nodes[0]]  # 返回：各决策点的最优回应策略 + 根节点的最优总价值
 
     def sequence_form_best_response(self, utility):
         strategy, value = self.behavioral_best_response(utility)
@@ -268,35 +329,81 @@ class TreeFormSequentialDecisionProcess(Serializable):
         return strategy
 
     def counterfactual_utilities(self, behavioral_strategy, utility):
-        V = defaultdict(int)
+        """计算每个决策点（信息集）的反事实（counterfactual）动作价值。
 
-        for p in reversed(self.nodes):
-            match self.node_types[p]:
+        这一步是 CFR 的“核心读数”之一。
+        在标准两人零和 CFR 中，给定当前策略 $\pi$，对玩家 $i$ 的信息集 $I$、动作 $a$，
+        定义反事实价值（常见记号）为：
+
+        $$
+        v_i^{\pi}(I,a) = \sum_{h\in I} \pi_{-i}(h)\,\pi_c(h)\, u_i^{\pi}(h\cdot a),
+        $$
+
+        以及信息集价值
+
+        $$
+        v_i^{\pi}(I) = \sum_{a\in A(I)} \pi_i(a\mid I)\, v_i^{\pi}(I,a).
+        $$
+
+        这里的实现把“对手与机会到达权重”折叠进 TFSDP 的结构/`utility` 中，
+        因而我们在树上做一次自底向上的动态规划即可得到类似的局部 Q 值：
+
+        - 对决策点 $I$：
+            $$
+            V(I) = \sum_{a\in A(I)} \pi(a\mid I)\,[u(I,a)+V(\text{next}(I,a))].
+            $$
+        - 对观测点 $O$：
+            $$
+            V(O) = \sum_{s\in S(O)} V(\text{next}(O,s)).
+            $$
+
+        然后对每个决策点输出动作级别的“反事实效用/局部 Q 值”：
+
+        $$
+        Q(I,a) = u(I,a) + V(\text{next}(I,a)).
+        $$
+
+        在 CFR 更新里，立即遗憾（instant regret）通常是：
+
+        $$
+        r(I,a) = Q(I,a) - V(I).
+        $$
+
+        本函数返回的是 $Q(I,a)$（命名为 utilities[j][i]），以及未显式返回但可由
+        上式组合得到的 $V(I)$。
+        """
+        V = defaultdict(int)  # V[p]：在给定行为策略 π 下，从节点 p 往后的“期望/汇总”价值（用于计算 Q）
+
+        for p in reversed(self.nodes):  # 同样自底向上；先算出每个节点的 V[p]
+            match self.node_types[p]:  # 决策点：按 π 加权求期望；观测点：按分支求和
                 case self.NodeType.DECISION_POINT:
-                    for i, a in enumerate(self.actions[p]):
+                    for i, a in enumerate(self.actions[p]):  # 遍历信息集/决策点 p 的每个动作 a
+                        # 期望形式 Bellman：V(p)=sum_a π(a|p) * (u(p,a)+V(next(p,a)))
                         V[p] += (
-                            behavioral_strategy[p][i]
+                            behavioral_strategy[p][i]  # π(a|p)：在 p 处选择动作 a 的概率
                             * (
-                                utility[self.sequences.index((p, a))]
-                                + V[self.transitions[p, a]]
+                                utility[self.sequences.index((p, a))]  # u(p,a)：序列边 (p,a) 的即时收益
+                                + V[self.transitions[p, a]]  # V(next)：采取 a 后到子节点的续行价值
                             )
                         )
                 case self.NodeType.OBSERVATION_POINT:
-                    for s in self.signals[p]:
-                        V[p] += V[self.transitions[p, s]]
+                    # 观测点仍是“展开所有信号分支并汇总”的约定：V(p)=sum_s V(next(p,s))
+                    for s in self.signals[p]:  # 枚举信号 s
+                        V[p] += V[self.transitions[p, s]]  # 累加每个信号分支的价值
 
-        utilities = {}
+        utilities = {}  # 输出：每个决策点 j -> 每个动作的 Q(j,a)（反事实/局部动作价值）
 
-        for j in self.decision_points:
-            utilities[j] = np.empty(len(self.actions[j]))
+        for j in self.decision_points:  # 逐个决策点（信息集）构造动作价值向量
+            utilities[j] = np.empty(len(self.actions[j]))  # utilities[j][i] 对应第 i 个动作的 Q 值
 
-            for i, a in enumerate(self.actions[j]):
+            for i, a in enumerate(self.actions[j]):  # 枚举动作 a
+                # 这里返回 Q(j,a)=u(j,a)+V(next(j,a))；CFR 里常用它与 V(j) 形成遗憾 r(j,a)
                 utilities[j][i] = (
-                    utility[self.sequences.index((j, a))]
-                    + V[self.transitions[j, a]]
+                    utility[self.sequences.index((j, a))]  # u(j,a)
+                    + V[self.transitions[j, a]]  # V(next)
                 )
 
-        return utilities
+        return utilities  # 返回每个信息集的动作价值（用于 r(j,a)=Q(j,a)-V(j) 等更新）
 
     def serialize(self):
         raw_data = []
@@ -311,205 +418,126 @@ class TreeFormSequentialDecisionProcess(Serializable):
 
         return raw_data
 
+    # Backward-compatible alias: older code (e.g. games.py) expects `to_list()`.
+    def to_list(self):
+        return self.serialize()
 
-def persist_openspiel_tfsdp_per_agent(
+
+
+def persist_openspiel_game_per_agent(
         game: Any,
         out_dir: str | os.PathLike,
         *,
-        file_prefix: str = 'tfsdp_player',
-        split_depth: int = 1,
-        num_workers: int | None = None,
-        hash_digest_size: int = 16,
+        file_prefix: str = 'openspiel_game',
+        hash_digest_size: int = 8,
         compress: bool = False,
-) -> list[Path]:
-    """Build and persist TFSDP(s) from an OpenSpiel game, one file per player.
+) -> Path:
+    """Persist an OpenSpiel extensive-form game in a template-compatible schema.
 
-    This is a faster/smaller alternative to round-tripping through JSON:
-    - encodes information sets / history nodes with a fixed-size hash;
-    - encodes actions/signals with per-node small integers;
-    - writes TFSDPs per player to avoid sequential read bottlenecks.
+    This mirrors the JSON structure produced by `scripts/from-open-spiel.py`:
 
-    Files are written atomically as `{file_prefix}{p}.pkl[.gz]` under `out_dir`.
+    - `tree_form_sequential_decision_processes`: list[ list[transition] ] (one per player)
+    - `utilities`: sparse list of terminal utilities keyed by per-player sequences
+
+    but uses a more compact encoding:
+    - decision points are hashed integers (via blake2b of information state strings)
+    - actions are OpenSpiel action ids (integers)
+    - observation points / END nodes are still represented in the TFSDP tree
+
+    The output is pickled as `{file_prefix}.pkl[.gz]` in `out_dir`.
     """
     try:
-        from pyspiel import SpielError  # type: ignore
+        from pyspiel import GameType, SpielError  # type: ignore
     except Exception as e:  # pragma: no cover
         raise ImportError(
-            'pyspiel is required to build TFSDPs from an OpenSpiel game.',
+            'pyspiel is required to persist OpenSpiel games.',
         ) from e
 
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
 
-    if split_depth < 0:
-        raise ValueError('split_depth must be >= 0')
     if hash_digest_size < 8:
-        # 64-bit digests are already tiny; going below that is asking for trouble.
         raise ValueError('hash_digest_size must be >= 8 bytes')
 
     player_count = game.num_players()
-    # children[p][parent_sequence] = set(child_infoset_hashes)
-    children: list[dict[tuple, set[int]]] = [
-        defaultdict(set) for _ in range(player_count)
-    ]
-    # actions[p][infoset_hash] = set(action_int)
-    actions: list[dict[int, set[int]]] = [
-        defaultdict(set) for _ in range(player_count)
-    ]
 
     def _state_key(state: Any) -> int:
-        # Prefer OpenSpiel's information state for the current player. Some
-        # (perfect-information) games might not implement it, so fall back to a
-        # stable textual representation.
         try:
             s = state.information_state_string()
         except SpielError:
-            # history_str() is available in many games and is more stable than str().
             s = state.history_str() if hasattr(state, 'history_str') else str(state)
 
         digest = hashlib.blake2b(
             s.encode('utf-8', errors='strict'),
             digest_size=hash_digest_size,
-            person=b'nogret-openspiel',
+            person=b'history',
         ).digest()
         return int.from_bytes(digest, 'big', signed=False)
 
-    def _process_decision_node(state: Any, sequences: list[tuple]) -> None:
+    # Single-pass DFS over the OpenSpiel tree:
+    # - build children/actions maps (structure)
+    # - accumulate terminal utilities (expected over chance) keyed by hashed sequences
+    children: list[dict[tuple, set[int]]] = [
+        defaultdict(set) for _ in range(player_count)
+    ]
+    actions: list[dict[int, set[int]]] = [
+        defaultdict(set) for _ in range(player_count)
+    ]
+
+    utilities_hashed: defaultdict[tuple, np.ndarray] = defaultdict(
+        lambda: np.zeros(player_count, dtype=float),
+    )
+
+    init_sequences: list[tuple] = [()] * player_count
+    stack: list[tuple[Any, float, list[tuple]]] = [
+        (game.new_initial_state(), 1.0, init_sequences),
+    ]
+
+    while stack:
+        state, chance_prob, sequences = stack.pop()
+
+        if state.is_terminal():
+            utilities_hashed[tuple(sequences)] += (
+                chance_prob * np.array(state.rewards(), dtype=float)
+            )
+            continue
+
+        if state.is_chance_node():
+            for action, prob in state.chance_outcomes():
+                stack.append((
+                    state.child(action),
+                    chance_prob * float(prob),
+                    sequences,
+                ))
+            continue
+
         player = state.current_player()
         infoset = _state_key(state)
         parent_sequence = sequences[player]
 
         children[player][parent_sequence].add(infoset)
-        # Ensure the infoset exists even if it has no legal actions (rare, but
-        # avoids KeyError in downstream indexing).
         actions[player].setdefault(infoset, set())
 
-        # Record legal actions for this information set and ensure a key exists
-        # for each continuation sequence.
         for action in state.legal_actions():
-            actions[player][infoset].add(int(action))
-            children[player].setdefault((infoset, int(action)), set())
+            a = int(action)
+            actions[player][infoset].add(a)
+            children[player].setdefault((infoset, a), set())
 
-    def _explore_many(roots: list[tuple[Any, list[tuple]]]):
-        local_children: list[dict[tuple, set[int]]] = [
-            defaultdict(set) for _ in range(player_count)
-        ]
-        local_actions: list[dict[int, set[int]]] = [
-            defaultdict(set) for _ in range(player_count)
-        ]
-
-        # Small helper that mirrors _process_decision_node but writes locally.
-        def _local_process(state: Any, sequences: list[tuple]) -> None:
-            player = state.current_player()
-            infoset = _state_key(state)
-            parent_sequence = sequences[player]
-
-            local_children[player][parent_sequence].add(infoset)
-            local_actions[player].setdefault(infoset, set())
-
-            for action in state.legal_actions():
-                local_actions[player][infoset].add(int(action))
-                local_children[player].setdefault((infoset, int(action)), set())
-
-        stack: list[tuple[Any, list[tuple]]] = roots[:]
-
-        while stack:
-            state, sequences = stack.pop()
-            if state.is_terminal():
-                continue
-            if state.is_chance_node():
-                for action, _prob in state.chance_outcomes():
-                    stack.append((state.child(action), sequences))
-                continue
-
-            _local_process(state, sequences)
-            player = state.current_player()
-            infoset = _state_key(state)
-
-            for action in state.legal_actions():
-                child = state.child(action)
-                child_sequences = sequences.copy()
-                child_sequences[player] = (infoset, int(action))
-                stack.append((child, child_sequences))
-
-        return local_children, local_actions
-
-    # Build a frontier up to split_depth, processing nodes above the frontier
-    # sequentially to avoid double counting.
-    init_sequences: list[tuple] = [()] * player_count
-    frontier: list[tuple[Any, list[tuple]]] = []
-    stack: list[tuple[Any, list[tuple], int]] = [(game.new_initial_state(), init_sequences, 0)]
-
-    while stack:
-        state, sequences, depth = stack.pop()
-        if depth >= split_depth:
-            frontier.append((state, sequences))
-            continue
-        if state.is_terminal():
-            continue
-        if state.is_chance_node():
-            for action, _prob in state.chance_outcomes():
-                stack.append((state.child(action), sequences, depth + 1))
-            continue
-
-        _process_decision_node(state, sequences)
-        player = state.current_player()
-        infoset = _state_key(state)
-
-        for action in state.legal_actions():
             child = state.child(action)
             child_sequences = sequences.copy()
-            child_sequences[player] = (infoset, int(action))
-            stack.append((child, child_sequences, depth + 1))
+            child_sequences[player] = (infoset, a)
+            stack.append((child, chance_prob, child_sequences))
 
-    # Parallel exploration of the frontier.
-    if num_workers is None:
-        num_workers = max(1, (os.cpu_count() or 1))
-    num_workers = max(1, int(num_workers))
+    # 2) Build per-player TFSDPs using the existing compact encoding
+    #    (contiguous decision ids + per-node event ids).
+    decision_ids: list[dict[int, int]] = []
+    action_event_ids: list[dict[int, dict[int, int]]] = []
+    tfsdps: list[TreeFormSequentialDecisionProcess] = []
 
-    # Chunk frontier to avoid "one task per node" overhead when the root fans out.
-    chunks: list[list[tuple[Any, list[tuple]]]] = []
-    if frontier:
-        chunk_count = min(num_workers, len(frontier))
-        chunks = [[] for _ in range(chunk_count)]
-        for i, item in enumerate(frontier):
-            chunks[i % chunk_count].append(item)
+    for p in range(player_count):
+        children_map = children[p]
+        actions_map = actions[p]
 
-    if chunks and len(chunks) > 1:
-        import concurrent.futures as _fut
-
-        results = []
-        with _fut.ThreadPoolExecutor(max_workers=len(chunks)) as ex:
-            for chunk in chunks:
-                results.append(ex.submit(_explore_many, chunk))
-            for fut in results:
-                local_children, local_actions = fut.result()
-                for p in range(player_count):
-                    for k, v in local_children[p].items():
-                        children[p][k].update(v)
-                    for k, v in local_actions[p].items():
-                        actions[p][k].update(v)
-    elif frontier or split_depth == 0:
-        # Either split_depth=0 (nothing has been processed yet), or a small
-        # frontier that we explore sequentially in one worker to avoid overhead.
-        local_children, local_actions = _explore_many(
-            frontier or [(game.new_initial_state(), init_sequences)],
-        )
-        for p in range(player_count):
-            for k, v in local_children[p].items():
-                children[p][k].update(v)
-            for k, v in local_actions[p].items():
-                actions[p][k].update(v)
-    else:
-        # The full tree was processed sequentially while building the frontier.
-        pass
-
-    def _build_tfsdp(
-            player: int,
-            children_map: dict[tuple, set[int]],
-            actions_map: dict[int, set[int]],
-    ) -> TreeFormSequentialDecisionProcess:
-        # Deterministic node ids: sort by hashed infoset key.
         infoset_set: set[int] = set(actions_map.keys())
         for parent_seq, next_infos in children_map.items():
             if parent_seq:
@@ -518,7 +546,6 @@ def persist_openspiel_tfsdp_per_agent(
         infosets = sorted(infoset_set)
         decision_id = {h: i for i, h in enumerate(infosets)}
 
-        # Deterministic per-node event ids: sort by OpenSpiel action id.
         action_event_id: dict[int, dict[int, int]] = {}
         for h in infosets:
             ordered = sorted(actions_map.get(h, set()))
@@ -533,6 +560,7 @@ def persist_openspiel_tfsdp_per_agent(
 
         transitions: dict[tuple, int] = {}
         obs_next = len(decision_id)
+        pending_obs_children: dict[int, list[int]] = {}
 
         def _target_node(parent_sequence: tuple) -> int:
             nonlocal obs_next
@@ -547,16 +575,12 @@ def persist_openspiel_tfsdp_per_agent(
             obs_next += 1
             node_types[obs_id] = TreeFormSequentialDecisionProcess.NodeType.OBSERVATION_POINT
 
-            # Deterministic signal ordering based on child decision node id.
             ordered = sorted(next_infosets, key=lambda x: decision_id[x])
-            for i, h in enumerate(ordered):
-                transitions[(obs_id, i)] = decision_id[h]
+            pending_obs_children[obs_id] = [decision_id[h] for h in ordered]
             return obs_id
 
-        def _expand_from_root():
-            # Iterative DFS to avoid Python recursion limits on large games.
+        def _expand_from_root() -> None:
             stack_edges: list[tuple] = [()]
-
             while stack_edges:
                 parent_edge = stack_edges.pop()
                 child_node = transitions[parent_edge]
@@ -565,9 +589,7 @@ def persist_openspiel_tfsdp_per_agent(
 
                 ntype = node_types[child_node]
                 if ntype == TreeFormSequentialDecisionProcess.NodeType.DECISION_POINT:
-                    # Enumerate actions from this decision point in a stable order.
                     infoset_hash = infosets[child_node]
-                    # event ids are already 0..k-1, so sort by eid for stability.
                     ordered = sorted(
                         action_event_id[infoset_hash].items(),
                         key=lambda kv: kv[1],
@@ -578,10 +600,11 @@ def persist_openspiel_tfsdp_per_agent(
                         if edge not in transitions:
                             transitions[edge] = _target_node((infoset_hash, action))
                         edges.append(edge)
-                    # DFS stack is LIFO; push in reverse so smaller eid is processed first.
                     stack_edges.extend(reversed(edges))
                 elif ntype == TreeFormSequentialDecisionProcess.NodeType.OBSERVATION_POINT:
-                    # Expand each signal edge (added in _target_node).
+                    if (child_node, 0) not in transitions:
+                        for i, nid in enumerate(pending_obs_children.get(child_node, [])):
+                            transitions[(child_node, i)] = nid
                     i = 0
                     edges = []
                     while (child_node, i) in transitions:
@@ -589,47 +612,87 @@ def persist_openspiel_tfsdp_per_agent(
                         i += 1
                     stack_edges.extend(reversed(edges))
 
-        # Build all reachable transitions from the root.
         transitions[()] = _target_node(())
         _expand_from_root()
 
-        return TreeFormSequentialDecisionProcess(transitions, node_types)
+        tfsdps.append(TreeFormSequentialDecisionProcess(transitions, node_types))
+        decision_ids.append(decision_id)
+        action_event_ids.append(action_event_id)
 
-    tfsdps = [
-        _build_tfsdp(p, children[p], actions[p])
-        for p in range(player_count)
-    ]
+    # Map utilities keyed by hashed sequences to utilities keyed by internal TFSDP
+    # sequence edges (node_id, event_id), without re-walking the OpenSpiel tree.
+    utilities: defaultdict[tuple, np.ndarray] = defaultdict(
+        lambda: np.zeros(player_count, dtype=float),
+    )
 
-    # Write one file per player; include minimal metadata for future proofing.
-    meta = {
-        'format': 'nogret.tfsdp.openspiel.per_agent',
-        'version': 1,
-        'player_count': player_count,
-        'hash_digest_size': hash_digest_size,
+    for hashed_sequences, vals in utilities_hashed.items():
+        internal_sequences: list[tuple] = []
+        for p, seq in enumerate(hashed_sequences):
+            if not seq:
+                internal_sequences.append(())
+                continue
+            infoset_hash, action_id = seq
+            nid = decision_ids[p][int(infoset_hash)]
+            eid = action_event_ids[p][int(infoset_hash)][int(action_id)]
+            internal_sequences.append((nid, eid))
+
+        utilities[tuple(internal_sequences)] += vals
+
+    # Serialize utilities in the same sparse list style as the template.
+    raw_utilities = []
+    zero_sum = (
+        player_count == 2
+        and game.get_type().utility == GameType.Utility.ZERO_SUM
+    )
+
+    for seqs in sorted(utilities.keys()):
+        vals = utilities[seqs]
+        if zero_sum:
+            raw_utilities.append({'sequences': list(seqs), 'value': float(vals[0])})
+        else:
+            raw_utilities.append({'sequences': list(seqs), 'values': vals.tolist()})
+
+    raw_tfsdps = [t.to_list() for t in tfsdps]
+    raw_game = {
+        'tree_form_sequential_decision_processes': raw_tfsdps,
+        'utilities': raw_utilities,
+        'meta': {
+            'format': 'nogret.openspiel.game.per_agent',
+            'version': 1,
+            'player_count': player_count,
+            'hash_digest_size': hash_digest_size,
+            'zero_sum': bool(zero_sum),
+        },
     }
 
-    meta_path = out_path / f'{file_prefix}.meta.pkl'
-    tmp_meta = meta_path.with_suffix(meta_path.suffix + '.tmp')
-    with open(tmp_meta, 'wb') as f:
-        pickle.dump(meta, f, protocol=pickle.HIGHEST_PROTOCOL)
-    os.replace(tmp_meta, meta_path)
+    suffix = '.pkl.gz' if compress else '.pkl'
+    out_file = out_path / f'{file_prefix}{suffix}'
+    tmp = out_file.with_suffix(out_file.suffix + '.tmp')
 
-    paths: list[Path] = []
-    for p, tfsdp in enumerate(tfsdps):
-        suffix = '.pkl.gz' if compress else '.pkl'
-        path = out_path / f'{file_prefix}{p}{suffix}'
-        tmp = path.with_suffix(path.suffix + '.tmp')
+    if compress:
+        with gzip.open(tmp, 'wb', compresslevel=1) as f:
+            pickle.dump(raw_game, f, protocol=pickle.HIGHEST_PROTOCOL)
+    else:
+        with open(tmp, 'wb') as f:
+            pickle.dump(raw_game, f, protocol=pickle.HIGHEST_PROTOCOL)
+    os.replace(tmp, out_file)
 
-        if compress:
-            with gzip.open(tmp, 'wb', compresslevel=1) as f:
-                pickle.dump(tfsdp, f, protocol=pickle.HIGHEST_PROTOCOL)
-        else:
-            with open(tmp, 'wb') as f:
-                pickle.dump(tfsdp, f, protocol=pickle.HIGHEST_PROTOCOL)
-        os.replace(tmp, path)
-        paths.append(path)
+    return out_file
 
-    return paths
+
+def load_openspiel_game_per_agent(
+        path: str | os.PathLike,
+) -> dict[str, Any]:
+    """Load a bundle written by persist_openspiel_game_per_agent()."""
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(str(p))
+
+    if p.suffixes[-2:] == ['.pkl', '.gz'] or p.suffix == '.gz':
+        with gzip.open(p, 'rb') as f:
+            return pickle.load(f)
+    with open(p, 'rb') as f:
+        return pickle.load(f)
 
 
 def load_openspiel_tfsdp_per_agent(
