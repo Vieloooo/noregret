@@ -23,6 +23,32 @@ from noregret.utilities import *
 
 
 
+def _fmt_bytes(n: int | float | None) -> str:
+    if n is None:
+        return 'NA'
+    try:
+        n = float(n)
+    except Exception:
+        return 'NA'
+    units = ['B', 'KiB', 'MiB', 'GiB', 'TiB']
+    i = 0
+    while n >= 1024.0 and i < len(units) - 1:
+        n /= 1024.0
+        i += 1
+    return f'{n:.2f}{units[i]}'
+
+
+def _dprint(enabled: bool, msg: str, **meta: Any) -> None:
+    if not enabled:
+        return
+    if meta:
+        payload = ' '.join(f'{k}={v}' for k, v in meta.items())
+        print(f'[nogret.serial] {msg} | {payload}', flush=True)
+    else:
+        print(f'[nogret.serial] {msg}', flush=True)
+
+
+
 def persist_openspiel_game_per_agent(
         game: Any,
         out_dir: str | os.PathLike,
@@ -30,6 +56,7 @@ def persist_openspiel_game_per_agent(
         file_prefix: str = 'openspiel_game',
         hash_digest_size: int = 8,
         compress: bool = False,
+        debug: bool = False,
 ) -> Path:
     """Persist an OpenSpiel extensive-form game in a template-compatible schema.
 
@@ -59,6 +86,16 @@ def persist_openspiel_game_per_agent(
         raise ValueError('hash_digest_size must be >= 8 bytes')
 
     player_count = game.num_players()
+
+    _dprint(
+        debug,
+        'persist_openspiel_game_per_agent: start',
+        out_dir=str(out_path),
+        file_prefix=file_prefix,
+        player_count=int(player_count),
+        hash_digest_size=int(hash_digest_size),
+        compress=bool(compress),
+    )
 
     def _state_key(state: Any) -> int:
         try:
@@ -103,16 +140,28 @@ def persist_openspiel_game_per_agent(
         (game.new_initial_state(), 1.0, init_sequences),
     ]
 
+    # Lightweight traversal stats for debugging.
+    expanded_states = 0
+    terminal_states = 0
+    chance_states = 0
+    decision_states = 0
+    max_stack = len(stack)
+
     while stack:
         state, chance_prob, sequences = stack.pop()
+        expanded_states += 1
+        if len(stack) > max_stack:
+            max_stack = len(stack)
 
         if state.is_terminal():
+            terminal_states += 1
             utilities_hashed[tuple(sequences)] += (
                 chance_prob * np.array(state.rewards(), dtype=float)
             )
             continue
 
         if state.is_chance_node():
+            chance_states += 1
             # Match recursive DFS order: iterate outcomes in the given order.
             frames: list[tuple[Any, float, list[tuple]]] = []
             for action, prob in state.chance_outcomes():
@@ -126,6 +175,7 @@ def persist_openspiel_game_per_agent(
             continue
 
         player = state.current_player()
+        decision_states += 1
         try:
             infoset_str = state.information_state_string()
         except SpielError:
@@ -158,6 +208,17 @@ def persist_openspiel_game_per_agent(
             frames.append((child, chance_prob, child_sequences))
 
         stack.extend(reversed(frames))
+
+    _dprint(
+        debug,
+        'DFS finished',
+        expanded_states=int(expanded_states),
+        terminal_states=int(terminal_states),
+        chance_states=int(chance_states),
+        decision_states=int(decision_states),
+        utilities_profiles=int(len(utilities_hashed)),
+        max_stack=int(max_stack),
+    )
 
     # 2) Build per-player TFSDPs using the existing compact encoding
     #    (contiguous decision ids + per-node event ids).
@@ -243,6 +304,26 @@ def persist_openspiel_game_per_agent(
         decision_ids.append(decision_id)
         action_event_ids.append(action_event_id)
 
+        # Per-player TFSDP summary.
+        try:
+            seq_count = len(tfsdps[-1].sequences)
+        except Exception:
+            seq_count = 'NA'
+        obs_count = sum(
+            1 for t in node_types.values()
+            if t == TreeFormSequentialDecisionProcess.NodeType.OBSERVATION_POINT
+        )
+        _dprint(
+            debug,
+            'TFSDP built',
+            player=int(p),
+            infosets=int(len(infosets)),
+            decision_points=int(len(decision_id)),
+            observation_points=int(obs_count),
+            sequences=seq_count,
+            transitions=int(len(transitions)),
+        )
+
     # Map utilities keyed by hashed sequences to utilities keyed by internal TFSDP
     # sequence edges (node_id, event_id), without re-walking the OpenSpiel tree.
     utilities: defaultdict[tuple, np.ndarray] = defaultdict(
@@ -261,6 +342,13 @@ def persist_openspiel_game_per_agent(
             internal_sequences.append((nid, eid))
 
         utilities[tuple(internal_sequences)] += vals
+
+    _dprint(
+        debug,
+        'Utilities mapped to internal sequences',
+        nonzero_profiles=int(len(utilities)),
+        shape=tuple(int(x) for x in (tuple(len(t.sequences) for t in tfsdps))),
+    )
 
     # Serialize utilities in the same sparse list style as the template.
     zero_sum = (
@@ -311,6 +399,12 @@ def persist_openspiel_game_per_agent(
             'player_count': 2,
             'utility': _pack_csr(m),
         }
+        _dprint(
+            debug,
+            'Packed utilities (2p zero-sum csr)',
+            shape=tuple(int(x) for x in m.shape),
+            nnz=int(m.nnz),
+        )
     else:
         # Unified representation: sparse profiles + per-player sparse values.
         # Coords is (nnz, player_count) of per-player sequence indices.
@@ -330,6 +424,19 @@ def persist_openspiel_game_per_agent(
             'coords': coords,
             'values': [_pack_csr(v) for v in per_player_vecs],
         }
+        # Best-effort nnz from packed vectors.
+        nnz_each = []
+        try:
+            nnz_each = [int(v.nnz) for v in per_player_vecs]
+        except Exception:
+            nnz_each = []
+        _dprint(
+            debug,
+            'Packed utilities (profile_per_player)',
+            nnz=int(nnz),
+            coords_shape=tuple(int(x) for x in coords.shape),
+            per_player_vec_nnz=nnz_each,
+        )
 
     raw_tfsdps = [t.to_list() for t in tfsdps]
     raw_game = {
@@ -356,16 +463,31 @@ def persist_openspiel_game_per_agent(
             pickle.dump(raw_game, f, protocol=pickle.HIGHEST_PROTOCOL)
     os.replace(tmp, out_file)
 
+    try:
+        size_b = out_file.stat().st_size
+    except Exception:
+        size_b = None
+    _dprint(
+        debug,
+        'persist_openspiel_game_per_agent: done',
+        out_file=str(out_file),
+        file_size=_fmt_bytes(size_b),
+    )
+
     return out_file
 
 
 def load_openspiel_game_per_agent(
         path: str | os.PathLike,
+        *,
+        debug: bool = False,
 ) -> dict[str, Any]:
     """Load a bundle written by persist_openspiel_game_per_agent()."""
     p = Path(path)
     if not p.exists():
         raise FileNotFoundError(str(p))
+
+    _dprint(debug, 'load_openspiel_game_per_agent: start', path=str(p))
 
     def _restore_raw_utilities(bundle: dict[str, Any]) -> dict[str, Any]:
         utilities = bundle.get('utilities')
@@ -492,7 +614,24 @@ def load_openspiel_game_per_agent(
             obj = pickle.load(f)
 
     if isinstance(obj, dict):
+        meta = obj.get('meta', {}) if isinstance(obj.get('meta', {}), dict) else {}
+        utilities = obj.get('utilities', {}) if isinstance(obj.get('utilities', {}), dict) else {}
+        _dprint(
+            debug,
+            'Bundle loaded (pre-restore)',
+            format=meta.get('format', 'NA'),
+            version=meta.get('version', 'NA'),
+            player_count=meta.get('player_count', 'NA'),
+            utilities_kind=utilities.get('kind', 'NA'),
+        )
         obj = _restore_raw_utilities(obj)
+        if isinstance(obj, dict) and 'raw_utilities' in obj:
+            _dprint(
+                debug,
+                'Utilities restored to raw list',
+                raw_len=int(len(obj.get('raw_utilities', []))),
+            )
+    _dprint(debug, 'load_openspiel_game_per_agent: done')
     return obj
 
 
