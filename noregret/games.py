@@ -400,22 +400,86 @@ class TwoPlayerExtensiveFormGame(TwoPlayerGame, ExtensiveFormGame):
         tfsdps = TreeFormSequentialDecisionProcess.deserialize_all(
             raw_data['tree_form_sequential_decision_processes'],
         )
+        utilities = raw_data['utilities']
+
+        # Unified sparse profile format: coords + per-player sparse value vectors.
+        if isinstance(utilities, dict) and utilities.get('kind') == 'scipy.sparse.profile_per_player':
+            if int(utilities.get('player_count', 2)) != 2:
+                raise ValueError('utility is not of a 2-player game')
+            if bool(utilities.get('zero_sum', False)):
+                raise ValueError('expected general-sum utilities, got zero-sum')
+
+            coords = np.asarray(utilities['coords'])
+            payloads = list(utilities['values'])
+            nnz = int(coords.shape[0])
+
+            def _csr_vector_payload_to_dense(payload, length: int) -> np.ndarray:
+                if payload.get('type') != 'csr':
+                    raise ValueError('unsupported sparse utility type')
+                shape = tuple(payload['shape'])
+                if shape != (length, 1):
+                    raise ValueError('unexpected sparse vector shape')
+                indptr = payload['indptr']
+                data = payload['data']
+                out = np.zeros(length, dtype=float)
+                for i in range(length):
+                    start = indptr[i]
+                    end = indptr[i + 1]
+                    if end > start:
+                        out[i] = float(data[start])
+                return out
+
+            row_vals = _csr_vector_payload_to_dense(payloads[0], nnz)
+            col_vals = _csr_vector_payload_to_dense(payloads[1], nnz)
+
+            shape = tuple(len(tfsdp.sequences) for tfsdp in tfsdps)
+            row_utilities = lil_array(shape)
+            column_utilities = lil_array(shape)
+            for k in range(nnz):
+                i = int(coords[k, 0])
+                j = int(coords[k, 1])
+                row_utilities[i, j] = float(row_vals[k])
+                column_utilities[i, j] = float(col_vals[k])
+
+            return cls(tfsdps, [row_utilities.tocsr(), column_utilities.tocsr()])
+
+        # New packed sparse format (persist_openspiel_game_per_agent meta version >= 2).
+        if isinstance(utilities, dict) and utilities.get('kind') == 'scipy.sparse.csr':
+            from scipy.sparse import csr_array  # type: ignore
+
+            if int(utilities.get('player_count', 2)) != 2:
+                raise ValueError('utility is not of a 2-player game')
+            if bool(utilities.get('zero_sum', False)):
+                raise ValueError('expected general-sum utilities, got zero-sum')
+
+            def _unpack_csr(payload):
+                if payload.get('type') != 'csr':
+                    raise ValueError('unsupported sparse utility type')
+                shape = tuple(payload['shape'])
+                data = payload['data']
+                indices = payload['indices']
+                indptr = payload['indptr']
+                return csr_array((data, indices, indptr), shape=shape)
+
+            row = _unpack_csr(utilities['row_utility'])
+            col = _unpack_csr(utilities['column_utility'])
+            return cls(tfsdps, [row, col])
+
+        # Legacy template-compatible list format.
         shape = tuple(len(tfsdp.sequences) for tfsdp in tfsdps)
         row_utilities = lil_array(shape)
         column_utilities = lil_array(shape)
 
-        for raw_utility in raw_data['utilities']:
+        for raw_utility in utilities:
             if len(raw_utility['values']) != 2:
                 raise ValueError('utility is not of a 2-player game')
 
             indices = []
-
             for tfsdp, sequence in zip(tfsdps, raw_utility['sequences']):
                 sequence = tuple(sequence)
-
                 indices.append(tfsdp.sequences.index(sequence))
-
             indices = tuple(indices)
+
             row_utilities[indices] = raw_utility['values'][0]
             column_utilities[indices] = raw_utility['values'][1]
 
@@ -512,21 +576,40 @@ class TwoPlayerZeroSumExtensiveFormGame(
         tfsdps = TreeFormSequentialDecisionProcess.deserialize_all(
             raw_data['tree_form_sequential_decision_processes'],
         )
+        utilities = raw_data['utilities']
+
+        # New packed sparse format (persist_openspiel_game_per_agent meta version >= 2).
+        if isinstance(utilities, dict) and utilities.get('kind') == 'scipy.sparse.csr':
+            from scipy.sparse import csr_array  # type: ignore
+
+            if int(utilities.get('player_count', 2)) != 2:
+                raise ValueError('utility is not of a 2-player game')
+            if not bool(utilities.get('zero_sum', True)):
+                raise ValueError('expected zero-sum utilities, got general-sum')
+
+            payload = utilities['utility']
+            if payload.get('type') != 'csr':
+                raise ValueError('unsupported sparse utility type')
+            shape = tuple(payload['shape'])
+            data = payload['data']
+            indices = payload['indices']
+            indptr = payload['indptr']
+            u = csr_array((data, indices, indptr), shape=shape)
+            return cls(tfsdps, u)
+
+        # Legacy template-compatible list format.
         shape = tuple(len(tfsdp.sequences) for tfsdp in tfsdps)
-        utilities = lil_array(shape)
+        u_lil = lil_array(shape)
 
-        for raw_utility in raw_data['utilities']:
+        for raw_utility in utilities:
             indices = []
-
             for tfsdp, sequence in zip(tfsdps, raw_utility['sequences']):
                 sequence = tuple(sequence)
-
                 indices.append(tfsdp.sequences.index(sequence))
-
             indices = tuple(indices)
-            utilities[indices] = raw_utility['value']
+            u_lil[indices] = raw_utility['value']
 
-        return cls(tfsdps, utilities.tocsr())
+        return cls(tfsdps, u_lil.tocsr())
 
     @property
     def row_utilities(self):
