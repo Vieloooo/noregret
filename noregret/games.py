@@ -8,6 +8,7 @@ from typing import Any
 
 from ordered_set import OrderedSet
 from scipy.sparse import lil_array
+from scipy.sparse import csr_array
 import numpy as np
 
 from noregret.utilities import (
@@ -433,20 +434,20 @@ class TwoPlayerExtensiveFormGame(TwoPlayerGame, ExtensiveFormGame):
             col_vals = _csr_vector_payload_to_dense(payloads[1], nnz)
 
             shape = tuple(len(tfsdp.sequences) for tfsdp in tfsdps)
-            row_utilities = lil_array(shape)
-            column_utilities = lil_array(shape)
-            for k in range(nnz):
-                i = int(coords[k, 0])
-                j = int(coords[k, 1])
-                row_utilities[i, j] = float(row_vals[k])
-                column_utilities[i, j] = float(col_vals[k])
+        
+            # Vectorized construction: directly build CSR from coordinate arrays
+            # coords[:, 0] are row indices, coords[:, 1] are column indices
+            rows = coords[:, 0].astype(int, copy=False)
+            cols = coords[:, 1].astype(int, copy=False)
+
+            row_utilities = csr_array((row_vals, (rows, cols)), shape=shape)
+            column_utilities = csr_array((col_vals, (rows, cols)), shape=shape)
+
 
             return cls(tfsdps, [row_utilities.tocsr(), column_utilities.tocsr()])
 
         # New packed sparse format (persist_openspiel_game_per_agent meta version >= 2).
         if isinstance(utilities, dict) and utilities.get('kind') == 'scipy.sparse.csr':
-            from scipy.sparse import csr_array  # type: ignore
-
             if int(utilities.get('player_count', 2)) != 2:
                 raise ValueError('utility is not of a 2-player game')
             if bool(utilities.get('zero_sum', False)):
