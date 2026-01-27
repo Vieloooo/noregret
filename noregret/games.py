@@ -637,6 +637,164 @@ class TwoPlayerZeroSumExtensiveFormGame(
 
 
 @dataclass
+class MultiPlayerExtensiveFormGame(ExtensiveFormGame):
+    """Multi-player (n-player) general-sum extensive-form game (EFG).
+
+    This class mirrors the 2-player `TwoPlayerExtensiveFormGame` API but stores
+    utilities in a sparse "profile list" representation:
+    - `coords`: (nnz, player_count) integer indices of per-player sequences
+    - `values`: list of length player_count; each entry is a dense float vector
+      of length nnz containing that player's payoff at each profile row.
+
+    For a fixed opponent strategy profile x_{-i}, the sequence-form utility
+    vector for player i is:
+      u_i[s_i] = sum_{s_{-i}} U_i[s_i, s_{-i}] * prod_{j!=i} x_j[s_j]
+    which we compute efficiently via `np.bincount` over sparse profiles.
+    """
+
+    @classmethod
+    def deserialize(cls, raw_data):
+        tfsdps = TreeFormSequentialDecisionProcess.deserialize_all(
+            raw_data['tree_form_sequential_decision_processes'],
+        )
+        utilities = raw_data['utilities']
+        player_count = len(tfsdps)
+
+        def _csr_vector_payload_to_dense(payload: dict[str, Any], length: int) -> np.ndarray:
+            """Unpack an (nnz x 1) CSR payload into a dense length-nnz vector."""
+            if payload.get('type') != 'csr':
+                raise ValueError('unsupported sparse utility type')
+            shape = tuple(payload['shape'])
+            if shape != (length, 1):
+                raise ValueError('unexpected sparse vector shape')
+            indptr = np.asarray(payload['indptr'])
+            data = np.asarray(payload['data'])
+            # Each row has 0 or 1 stored entries (column index is always 0).
+            row_nnz = (indptr[1:] - indptr[:-1]).astype(np.int64, copy=False)
+            out = np.zeros(length, dtype=float)
+            mask = row_nnz > 0
+            if mask.any():
+                positions = indptr[:-1][mask].astype(np.int64, copy=False)
+                out[mask] = data[positions].astype(float, copy=False)
+            return out
+
+        # Packed sparse profiles with per-player value vectors (recommended).
+        if isinstance(utilities, dict) and utilities.get('kind') == 'scipy.sparse.profile_per_player':
+            if int(utilities.get('player_count', player_count)) != player_count:
+                raise ValueError('utilities player_count does not match tfsdps')
+            if bool(utilities.get('zero_sum', False)):
+                raise ValueError('expected general-sum utilities, got zero-sum')
+
+            coords = np.asarray(utilities['coords'], dtype=np.int64)
+            nnz = int(coords.shape[0])
+            payloads = list(utilities['values'])
+            if len(payloads) != player_count:
+                raise ValueError('utilities values do not match player_count')
+            values = [
+                _csr_vector_payload_to_dense(payloads[p], nnz)
+                for p in range(player_count)
+            ]
+            return cls(tfsdps, {'coords': coords, 'values': values})
+
+        # Legacy/raw list format (template compatible).
+        if isinstance(utilities, list):
+            seq_index = [
+                {seq: i for i, seq in enumerate(tfsdps[p].sequences)}
+                for p in range(player_count)
+            ]
+            nnz = len(utilities)
+            coords = np.empty((nnz, player_count), dtype=np.int64)
+            values = [np.zeros(nnz, dtype=float) for _ in range(player_count)]
+            for k, raw_utility in enumerate(utilities):
+                seqs = raw_utility.get('sequences')
+                vals = raw_utility.get('values')
+                if seqs is None or vals is None:
+                    raise ValueError('expected raw utility entries with sequences/values')
+                if len(seqs) != player_count or len(vals) != player_count:
+                    raise ValueError('raw utility entry does not match player_count')
+                for p in range(player_count):
+                    seq = tuple(seqs[p])
+                    coords[k, p] = int(seq_index[p][seq])
+                    values[p][k] = float(vals[p])
+            return cls(tfsdps, {'coords': coords, 'values': values})
+
+        raise ValueError('unsupported utilities format for MultiPlayerExtensiveFormGame')
+
+    def _verify(self, **kwargs):
+        super()._verify(**kwargs)
+
+        coords = self.utilities.get('coords') if isinstance(self.utilities, dict) else None
+        values = self.utilities.get('values') if isinstance(self.utilities, dict) else None
+        if coords is None or values is None:
+            raise ValueError('missing utilities coords/values')
+        if int(np.asarray(coords).shape[1]) != self.player_count:
+            raise ValueError('coords do not match player_count')
+        if len(values) != self.player_count:
+            raise ValueError('values do not match player_count')
+
+    def dimension(self, player):
+        if not (0 <= int(player) < self.player_count):
+            raise ValueError(f'Player {player} does not exist')
+        return len(self.tree_form_sequential_decision_processes[int(player)].sequences)
+
+    @property
+    def utility_coords(self) -> np.ndarray:
+        return np.asarray(self.utilities['coords'], dtype=np.int64)
+
+    @property
+    def utility_values(self) -> list[np.ndarray]:
+        return list(self.utilities['values'])
+
+    def utility(self, player, *opponent_strategies):
+        player = int(player)
+        if len(opponent_strategies) != self.player_count - 1:
+            raise ValueError('expected opponent strategies for all other players')
+        full = list(opponent_strategies)
+        full.insert(player, None)
+
+        coords = self.utility_coords
+        nnz = int(coords.shape[0])
+        reach = np.ones(nnz, dtype=float)
+        for p in range(self.player_count):
+            if p == player:
+                continue
+            s = np.asarray(full[p], dtype=float)
+            reach *= s[coords[:, p]]
+
+        weights = self.utility_values[player] * reach
+        dim = self.dimension(player)
+        return np.bincount(
+            coords[:, player],
+            weights=weights,
+            minlength=dim,
+        ).astype(float, copy=False)
+
+    def value(self, player, *strategies):
+        player = int(player)
+        if len(strategies) != self.player_count:
+            raise ValueError('expected strategies for all players')
+        coords = self.utility_coords
+        nnz = int(coords.shape[0])
+        reach = np.ones(nnz, dtype=float)
+        for p in range(self.player_count):
+            s = np.asarray(strategies[p], dtype=float)
+            reach *= s[coords[:, p]]
+        return float(np.sum(self.utility_values[player] * reach))
+
+    def correlated_value(self, player, *strategies):
+        raise NotImplementedError
+
+    def best_response(self, player, *opponent_strategies):
+        player = int(player)
+        utility = self.utility(player, *opponent_strategies)
+        tfsdp = self.tree_form_sequential_decision_processes[player]
+        return tfsdp.sequence_form_best_response(utility)
+
+    def serialize(self):
+        raise NotImplementedError
+
+
+@dataclass
 class SymmetrizedGame(Game):
     """Symmetrized game.
 
