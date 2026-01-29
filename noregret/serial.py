@@ -20,6 +20,7 @@ import numpy as np
 import numpy.linalg as LA
 
 from noregret.utilities import *
+from pyspiel import GameType, SpielError
 
 
 
@@ -50,13 +51,16 @@ def _dprint(enabled: bool, msg: str, **meta: Any) -> None:
 
 
 def persist_openspiel_game_per_agent(
-        game: Any,
-        out_dir: str | os.PathLike,
-        *,
-        file_prefix: str = 'openspiel_game',
-        hash_digest_size: int = 8,
-        compress: bool = False,
-        debug: bool = False,
+    game: Any,
+    out_dir: str | os.PathLike,
+    *,
+    file_prefix: str = 'openspiel_game',
+    hash_digest_size: int = 8,
+    hash_infosets: bool = True,
+    check_hash_collisions: bool = False,
+    compress: bool = False,
+    sort_utilities: bool = False,
+    debug: bool = False,
 ) -> Path:
     """Persist an OpenSpiel extensive-form game in a template-compatible schema.
 
@@ -72,17 +76,12 @@ def persist_openspiel_game_per_agent(
 
     The output is pickled as `{file_prefix}.pkl[.gz]` in `out_dir`.
     """
-    try:
-        from pyspiel import GameType, SpielError  # type: ignore
-    except Exception as e:  # pragma: no cover
-        raise ImportError(
-            'pyspiel is required to persist OpenSpiel games.',
-        ) from e
+  
 
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
 
-    if hash_digest_size < 8:
+    if hash_infosets and hash_digest_size < 8:
         raise ValueError('hash_digest_size must be >= 8 bytes')
 
     player_count = game.num_players()
@@ -94,17 +93,18 @@ def persist_openspiel_game_per_agent(
         file_prefix=file_prefix,
         player_count=int(player_count),
         hash_digest_size=int(hash_digest_size),
+        hash_infosets=bool(hash_infosets),
+        check_hash_collisions=bool(check_hash_collisions),
+        sort_utilities=bool(sort_utilities),
         compress=bool(compress),
     )
 
-    def _state_key(state: Any) -> int:
-        try:
-            s = state.information_state_string()
-        except SpielError:
-            s = state.history_str() if hasattr(state, 'history_str') else str(state)
+    def _state_key_from_infoset(infoset_str: str) -> Any:
+        if not hash_infosets:
+            return infoset_str
 
         digest = hashlib.blake2b(
-            s.encode('utf-8', errors='strict'),
+            infoset_str.encode('utf-8', errors='strict'),
             digest_size=hash_digest_size,
             person=b'history',
         ).digest()
@@ -126,10 +126,10 @@ def persist_openspiel_game_per_agent(
     ]
 
     # Optional: store original information state strings for collision detection.
-    # (We still persist hashed ids for compactness.)
-    infoset_strings: list[dict[int, str]] = [
+    # Disabled by default because it can be memory-heavy on large games.
+    infoset_strings: list[dict[Any, str]] = [
         {} for _ in range(player_count)
-    ]
+    ] if check_hash_collisions and hash_infosets else []
 
     utilities_hashed: defaultdict[tuple, np.ndarray] = defaultdict(
         lambda: np.zeros(player_count, dtype=float),
@@ -155,9 +155,11 @@ def persist_openspiel_game_per_agent(
 
         if state.is_terminal():
             terminal_states += 1
-            utilities_hashed[tuple(sequences)] += (
-                chance_prob * np.array(state.rewards(), dtype=float)
-            )
+            # Hot path: avoid allocating a new NumPy array per terminal.
+            acc = utilities_hashed[tuple(sequences)]
+            rewards = state.rewards()
+            for i in range(player_count):
+                acc[i] += chance_prob * float(rewards[i])
             continue
 
         if state.is_chance_node():
@@ -181,14 +183,15 @@ def persist_openspiel_game_per_agent(
         except SpielError:
             infoset_str = state.history_str() if hasattr(state, 'history_str') else str(state)
 
-        infoset = _state_key(state)
-        prev = infoset_strings[player].get(infoset)
-        if prev is None:
-            infoset_strings[player][infoset] = infoset_str
-        elif prev != infoset_str:
-            raise ValueError(
-                'Information state hash collision detected; increase hash_digest_size.',
-            )
+        infoset = _state_key_from_infoset(infoset_str)
+        if infoset_strings:
+            prev = infoset_strings[player].get(infoset)
+            if prev is None:
+                infoset_strings[player][infoset] = infoset_str
+            elif prev != infoset_str:
+                raise ValueError(
+                    'Information state hash collision detected; increase hash_digest_size.',
+                )
 
         parent_sequence = sequences[player]
         children[player].setdefault(parent_sequence, OrderedSet()).add(infoset)
@@ -336,9 +339,9 @@ def persist_openspiel_game_per_agent(
             if not seq:
                 internal_sequences.append(())
                 continue
-            infoset_hash, action_id = seq
-            nid = decision_ids[p][int(infoset_hash)]
-            eid = action_event_ids[p][int(infoset_hash)][int(action_id)]
+            infoset_key, action_id = seq
+            nid = decision_ids[p][infoset_key]
+            eid = action_event_ids[p][infoset_key][int(action_id)]
             internal_sequences.append((nid, eid))
 
         utilities[tuple(internal_sequences)] += vals
@@ -362,42 +365,61 @@ def persist_openspiel_game_per_agent(
     #   SciPy CSR sparse vector (nnz x 1) per player (float). This avoids tuple
     #   payloads and works uniformly for 2-player general-sum and n-player games.
     raw_utilities: Any
-    try:
-        from scipy.sparse import lil_array  # type: ignore
-    except Exception as e:  # pragma: no cover
-        raise ImportError(
-            'scipy is required to persist utilities in sparse form.',
-        ) from e
-
     shape = tuple(len(t.sequences) for t in tfsdps)
     seq_index = [
         {seq: i for i, seq in enumerate(t.sequences)}
         for t in tfsdps
     ]
 
-    def _pack_csr(mat: Any) -> dict[str, Any]:
-        csr = mat.tocsr()
+    def _pack_csr_parts(
+            *,
+            shape_: tuple[int, int],
+            dtype_: str,
+            data: Any,
+            indices: Any,
+            indptr: Any,
+    ) -> dict[str, Any]:
         return {
             'type': 'csr',
-            'shape': tuple(int(x) for x in csr.shape),
-            'dtype': str(csr.dtype),
-            'data': csr.data,
-            'indices': csr.indices,
-            'indptr': csr.indptr,
+            'shape': tuple(int(x) for x in shape_),
+            'dtype': str(dtype_),
+            'data': data,
+            'indices': indices,
+            'indptr': indptr,
         }
 
     if zero_sum:
         # Keep the special-case compact matrix representation.
-        m = lil_array(shape, dtype=float)
-        for (s0, s1), vals in utilities.items():
-            i = seq_index[0][s0]
-            j = seq_index[1][s1]
-            m[i, j] = float(vals[0])
+        # Avoid slow Python-level LIL assignment by building CSR from COO in SciPy.
+        try:
+            from scipy.sparse import csr_array  # type: ignore
+        except Exception as e:  # pragma: no cover
+            raise ImportError(
+                'scipy is required to persist 2-player zero-sum utilities in CSR form.',
+            ) from e
+
+        nnz = len(utilities)
+        rows = np.empty(nnz, dtype=np.int64)
+        cols = np.empty(nnz, dtype=np.int64)
+        data = np.empty(nnz, dtype=float)
+
+        for k, ((s0, s1), vals) in enumerate(utilities.items()):
+            rows[k] = int(seq_index[0][s0])
+            cols[k] = int(seq_index[1][s1])
+            data[k] = float(vals[0])
+
+        m = csr_array((data, (rows, cols)), shape=shape)
         raw_utilities = {
             'kind': 'scipy.sparse.csr',
             'zero_sum': True,
             'player_count': 2,
-            'utility': _pack_csr(m),
+            'utility': _pack_csr_parts(
+                shape_=tuple(int(x) for x in m.shape),
+                dtype_=str(m.dtype),
+                data=m.data,
+                indices=m.indices,
+                indptr=m.indptr,
+            ),
         }
         _dprint(
             debug,
@@ -406,30 +428,44 @@ def persist_openspiel_game_per_agent(
             nnz=int(m.nnz),
         )
     else:
-        # Unified representation: sparse profiles + per-player sparse values.
+        # Unified representation: sparse profiles + per-player value vectors.
         # Coords is (nnz, player_count) of per-player sequence indices.
-        nnz = len(utilities)
-        coords = np.empty((nnz, player_count), dtype=np.int64)
-        per_player_vecs = [lil_array((nnz, 1), dtype=float) for _ in range(player_count)]
+        # We emit CSR payloads directly (shape=(nnz,1)) to avoid constructing SciPy LIL
+        # objects in Python.
+        items = list(utilities.items())
+        if sort_utilities:
+            items.sort(key=lambda kv: kv[0])
 
-        for k, (seqs, vals) in enumerate(sorted(utilities.items(), key=lambda kv: kv[0])):
+        nnz = len(items)
+        coords = np.empty((nnz, player_count), dtype=np.int64)
+        values_dense = np.empty((player_count, nnz), dtype=float)
+
+        for k, (seqs, vals) in enumerate(items):
             for p in range(player_count):
                 coords[k, p] = int(seq_index[p][seqs[p]])
-                per_player_vecs[p][k, 0] = float(vals[p])
+                values_dense[p, k] = float(vals[p])
+
+        indptr = np.arange(nnz + 1, dtype=np.int64)
+        indices = np.zeros(nnz, dtype=np.int32)
+        payloads = [
+            _pack_csr_parts(
+                shape_=(nnz, 1),
+                dtype_=str(values_dense.dtype),
+                data=values_dense[p].copy(),
+                indices=indices,
+                indptr=indptr,
+            )
+            for p in range(player_count)
+        ]
 
         raw_utilities = {
             'kind': 'scipy.sparse.profile_per_player',
             'player_count': int(player_count),
             'zero_sum': False,
             'coords': coords,
-            'values': [_pack_csr(v) for v in per_player_vecs],
+            'values': payloads,
         }
-        # Best-effort nnz from packed vectors.
-        nnz_each = []
-        try:
-            nnz_each = [int(v.nnz) for v in per_player_vecs]
-        except Exception:
-            nnz_each = []
+        nnz_each = [int(nnz)] * player_count
         _dprint(
             debug,
             'Packed utilities (profile_per_player)',
@@ -447,6 +483,9 @@ def persist_openspiel_game_per_agent(
             'version': 4,
             'player_count': player_count,
             'hash_digest_size': hash_digest_size,
+            'hash_infosets': bool(hash_infosets),
+            'check_hash_collisions': bool(check_hash_collisions),
+            'sort_utilities': bool(sort_utilities),
             'zero_sum': bool(zero_sum),
         },
     }
