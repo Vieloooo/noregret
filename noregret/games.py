@@ -17,6 +17,8 @@ from noregret.utilities import (
     TreeFormSequentialDecisionProcess,
 )
 
+FLOAT_DTYPE = np.float32
+
 
 @dataclass
 class Game(ABC):
@@ -260,7 +262,10 @@ class NormalFormGame(Serializable, Game):
 
     @classmethod
     def deserialize(cls, raw_data):
-        return cls(raw_data['actions'], np.array(raw_data['utilities']))
+        return cls(
+            raw_data['actions'],
+            np.array(raw_data['utilities'], dtype=FLOAT_DTYPE),
+        )
 
     actions: Any
     utilities: Any
@@ -320,7 +325,7 @@ class TwoPlayerNormalFormGame(TwoPlayerGame, NormalFormGame):
         return self.utilities[:, :, 1]
 
     def row_best_response(self, column_strategy):
-        strategy = np.zeros(len(self.row_actions))
+        strategy = np.zeros(len(self.row_actions), dtype=FLOAT_DTYPE)
         utility = self.row_utility(column_strategy)
         index = utility.argmax()
         strategy[index] = 1
@@ -328,7 +333,7 @@ class TwoPlayerNormalFormGame(TwoPlayerGame, NormalFormGame):
         return strategy, utility[index]
 
     def column_best_response(self, row_strategy):
-        strategy = np.zeros(len(self.column_actions))
+        strategy = np.zeros(len(self.column_actions), dtype=FLOAT_DTYPE)
         utility = self.column_utility(row_strategy)
         index = utility.argmax()
         strategy[index] = 1
@@ -421,13 +426,13 @@ class TwoPlayerExtensiveFormGame(TwoPlayerGame, ExtensiveFormGame):
                 if shape != (length, 1):
                     raise ValueError('unexpected sparse vector shape')
                 indptr = payload['indptr']
-                data = payload['data']
-                out = np.zeros(length, dtype=float)
+                data = np.asarray(payload['data'], dtype=FLOAT_DTYPE)
+                out = np.zeros(length, dtype=FLOAT_DTYPE)
                 for i in range(length):
                     start = indptr[i]
                     end = indptr[i + 1]
                     if end > start:
-                        out[i] = float(data[start])
+                        out[i] = data[start]
                 return out
 
             row_vals = _csr_vector_payload_to_dense(payloads[0], nnz)
@@ -440,8 +445,16 @@ class TwoPlayerExtensiveFormGame(TwoPlayerGame, ExtensiveFormGame):
             rows = coords[:, 0].astype(int, copy=False)
             cols = coords[:, 1].astype(int, copy=False)
 
-            row_utilities = csr_array((row_vals, (rows, cols)), shape=shape)
-            column_utilities = csr_array((col_vals, (rows, cols)), shape=shape)
+            row_utilities = csr_array(
+                (row_vals, (rows, cols)),
+                shape=shape,
+                dtype=FLOAT_DTYPE,
+            )
+            column_utilities = csr_array(
+                (col_vals, (rows, cols)),
+                shape=shape,
+                dtype=FLOAT_DTYPE,
+            )
 
 
             return cls(tfsdps, [row_utilities.tocsr(), column_utilities.tocsr()])
@@ -457,10 +470,14 @@ class TwoPlayerExtensiveFormGame(TwoPlayerGame, ExtensiveFormGame):
                 if payload.get('type') != 'csr':
                     raise ValueError('unsupported sparse utility type')
                 shape = tuple(payload['shape'])
-                data = payload['data']
+                data = np.asarray(payload['data'], dtype=FLOAT_DTYPE)
                 indices = payload['indices']
                 indptr = payload['indptr']
-                return csr_array((data, indices, indptr), shape=shape)
+                return csr_array(
+                    (data, indices, indptr),
+                    shape=shape,
+                    dtype=FLOAT_DTYPE,
+                )
 
             row = _unpack_csr(utilities['row_utility'])
             col = _unpack_csr(utilities['column_utility'])
@@ -468,8 +485,8 @@ class TwoPlayerExtensiveFormGame(TwoPlayerGame, ExtensiveFormGame):
 
         # Legacy template-compatible list format.
         shape = tuple(len(tfsdp.sequences) for tfsdp in tfsdps)
-        row_utilities = lil_array(shape)
-        column_utilities = lil_array(shape)
+        row_utilities = lil_array(shape, dtype=FLOAT_DTYPE)
+        column_utilities = lil_array(shape, dtype=FLOAT_DTYPE)
 
         for raw_utility in utilities:
             if len(raw_utility['values']) != 2:
@@ -592,15 +609,15 @@ class TwoPlayerZeroSumExtensiveFormGame(
             if payload.get('type') != 'csr':
                 raise ValueError('unsupported sparse utility type')
             shape = tuple(payload['shape'])
-            data = payload['data']
+            data = np.asarray(payload['data'], dtype=FLOAT_DTYPE)
             indices = payload['indices']
             indptr = payload['indptr']
-            u = csr_array((data, indices, indptr), shape=shape)
+            u = csr_array((data, indices, indptr), shape=shape, dtype=FLOAT_DTYPE)
             return cls(tfsdps, u)
 
         # Legacy template-compatible list format.
         shape = tuple(len(tfsdp.sequences) for tfsdp in tfsdps)
-        u_lil = lil_array(shape)
+        u_lil = lil_array(shape, dtype=FLOAT_DTYPE)
 
         for raw_utility in utilities:
             indices = []
@@ -669,14 +686,14 @@ class MultiPlayerExtensiveFormGame(ExtensiveFormGame):
             if shape != (length, 1):
                 raise ValueError('unexpected sparse vector shape')
             indptr = np.asarray(payload['indptr'])
-            data = np.asarray(payload['data'])
+            data = np.asarray(payload['data'], dtype=FLOAT_DTYPE)
             # Each row has 0 or 1 stored entries (column index is always 0).
             row_nnz = (indptr[1:] - indptr[:-1]).astype(np.int64, copy=False)
-            out = np.zeros(length, dtype=float)
+            out = np.zeros(length, dtype=FLOAT_DTYPE)
             mask = row_nnz > 0
             if mask.any():
                 positions = indptr[:-1][mask].astype(np.int64, copy=False)
-                out[mask] = data[positions].astype(float, copy=False)
+                out[mask] = data[positions].astype(FLOAT_DTYPE, copy=False)
             return out
 
         # Packed sparse profiles with per-player value vectors (recommended).
@@ -705,7 +722,10 @@ class MultiPlayerExtensiveFormGame(ExtensiveFormGame):
             ]
             nnz = len(utilities)
             coords = np.empty((nnz, player_count), dtype=np.int64)
-            values = [np.zeros(nnz, dtype=float) for _ in range(player_count)]
+            values = [
+                np.zeros(nnz, dtype=FLOAT_DTYPE)
+                for _ in range(player_count)
+            ]
             for k, raw_utility in enumerate(utilities):
                 seqs = raw_utility.get('sequences')
                 vals = raw_utility.get('values')
@@ -755,11 +775,11 @@ class MultiPlayerExtensiveFormGame(ExtensiveFormGame):
 
         coords = self.utility_coords
         nnz = int(coords.shape[0])
-        reach = np.ones(nnz, dtype=float)
+        reach = np.ones(nnz, dtype=FLOAT_DTYPE)
         for p in range(self.player_count):
             if p == player:
                 continue
-            s = np.asarray(full[p], dtype=float)
+            s = np.asarray(full[p], dtype=FLOAT_DTYPE)
             reach *= s[coords[:, p]]
 
         weights = self.utility_values[player] * reach
@@ -768,7 +788,7 @@ class MultiPlayerExtensiveFormGame(ExtensiveFormGame):
             coords[:, player],
             weights=weights,
             minlength=dim,
-        ).astype(float, copy=False)
+        ).astype(FLOAT_DTYPE, copy=False)
 
     def value(self, player, *strategies):
         player = int(player)
@@ -776,9 +796,9 @@ class MultiPlayerExtensiveFormGame(ExtensiveFormGame):
             raise ValueError('expected strategies for all players')
         coords = self.utility_coords
         nnz = int(coords.shape[0])
-        reach = np.ones(nnz, dtype=float)
+        reach = np.ones(nnz, dtype=FLOAT_DTYPE)
         for p in range(self.player_count):
-            s = np.asarray(strategies[p], dtype=float)
+            s = np.asarray(strategies[p], dtype=FLOAT_DTYPE)
             reach *= s[coords[:, p]]
         return float(np.sum(self.utility_values[player] * reach))
 

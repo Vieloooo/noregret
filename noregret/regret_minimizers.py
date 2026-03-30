@@ -15,6 +15,8 @@ from noregret.utilities import (
     stationary_distribution,
 )
 
+FLOAT_DTYPE = np.float32
+
 
 @dataclass
 class RegretMinimizer(ABC):
@@ -38,16 +40,44 @@ class RegretMinimizer(ABC):
             self.previous_strategy = np.full(
                 self.dimension,
                 1 / self.dimension,
+                dtype=FLOAT_DTYPE,
+            )
+        else:
+            self.previous_strategy = np.asarray(
+                self.previous_strategy,
+                dtype=FLOAT_DTYPE,
             )
 
         if self.average_strategy is None:
-            self.average_strategy = np.full(self.dimension, 1 / self.dimension)
+            self.average_strategy = np.full(
+                self.dimension,
+                1 / self.dimension,
+                dtype=FLOAT_DTYPE,
+            )
+        else:
+            self.average_strategy = np.asarray(
+                self.average_strategy,
+                dtype=FLOAT_DTYPE,
+            )
 
         if self.previous_utility is None:
-            self.previous_utility = np.zeros(self.dimension)
+            self.previous_utility = np.zeros(self.dimension, dtype=FLOAT_DTYPE)
+        else:
+            self.previous_utility = np.asarray(
+                self.previous_utility,
+                dtype=FLOAT_DTYPE,
+            )
 
         if self.cumulative_utility is None:
-            self.cumulative_utility = np.zeros(self.dimension)
+            self.cumulative_utility = np.zeros(
+                self.dimension,
+                dtype=FLOAT_DTYPE,
+            )
+        else:
+            self.cumulative_utility = np.asarray(
+                self.cumulative_utility,
+                dtype=FLOAT_DTYPE,
+            )
 
     @abstractmethod
     def next_strategy(self, prediction=False):
@@ -114,10 +144,26 @@ class ProbabilitySimplexRegretMinimizer(RegretMinimizer, ABC):
         super().__post_init__()
 
         if self.previous_regrets is None:
-            self.previous_regrets = np.zeros(self.dimension)
+            self.previous_regrets = np.zeros(
+                self.dimension,
+                dtype=FLOAT_DTYPE,
+            )
+        else:
+            self.previous_regrets = np.asarray(
+                self.previous_regrets,
+                dtype=FLOAT_DTYPE,
+            )
 
         if self.cumulative_regrets is None:
-            self.cumulative_regrets = np.zeros(self.dimension)
+            self.cumulative_regrets = np.zeros(
+                self.dimension,
+                dtype=FLOAT_DTYPE,
+            )
+        else:
+            self.cumulative_regrets = np.asarray(
+                self.cumulative_regrets,
+                dtype=FLOAT_DTYPE,
+            )
 
     def observe_utility(self, utility):
         super().observe_utility(utility)
@@ -152,7 +198,10 @@ class MultiplicativeWeightsUpdate(FollowTheRegularizedLeader):
 
             theta = prediction + self.cumulative_utility
 
-        strategy = softmax(self.learning_rate * theta)
+        strategy = np.asarray(
+            softmax(self.learning_rate * theta),
+            dtype=FLOAT_DTYPE,
+        )
 
         self.strategies.append(strategy)
 
@@ -172,8 +221,11 @@ class EuclideanRegularization(FollowTheRegularizedLeader):
 
             theta = prediction + self.cumulative_utility
 
-        strategy = euclidean_projection_on_probability_simplex(
-            self.learning_rate * theta,
+        strategy = np.asarray(
+            euclidean_projection_on_probability_simplex(
+                self.learning_rate * theta,
+            ),
+            dtype=FLOAT_DTYPE,
         )
 
         self.strategies.append(strategy)
@@ -198,8 +250,11 @@ class OnlineGradientDescent(MirrorDescent):
         else:
             theta = prediction
 
-        strategy = euclidean_projection_on_probability_simplex(
-            self.previous_strategy + self.learning_rate * theta,
+        strategy = np.asarray(
+            euclidean_projection_on_probability_simplex(
+                self.previous_strategy + self.learning_rate * theta,
+            ),
+            dtype=FLOAT_DTYPE,
         )
 
         self.strategies.append(strategy)
@@ -228,9 +283,16 @@ class RegretMatching(ProbabilitySimplexRegretMinimizer):
 
     def _next_strategy(self, unnormalized_strategy):
         if np.allclose(unnormalized_strategy, 0):
-            strategy = np.full(self.dimension, 1 / self.dimension)
+            strategy = np.full(
+                self.dimension,
+                1 / self.dimension,
+                dtype=FLOAT_DTYPE,
+            )
         else:
-            strategy = unnormalized_strategy / unnormalized_strategy.sum()
+            strategy = np.asarray(
+                unnormalized_strategy / unnormalized_strategy.sum(),
+                dtype=FLOAT_DTYPE,
+            )
 
         self.strategies.append(strategy)
 
@@ -248,7 +310,15 @@ class RegretMatchingPlus(RegretMatching):
         super().__post_init__()
 
         if self.cumulative_regrets_plus is None:
-            self.cumulative_regrets_plus = np.zeros(self.dimension)
+            self.cumulative_regrets_plus = np.zeros(
+                self.dimension,
+                dtype=FLOAT_DTYPE,
+            )
+        else:
+            self.cumulative_regrets_plus = np.asarray(
+                self.cumulative_regrets_plus,
+                dtype=FLOAT_DTYPE,
+            )
 
     def next_strategy(self, prediction=False):
         if prediction is False:
@@ -306,7 +376,15 @@ class DiscountedRegretMatching(
         super().__post_init__()
 
         if self.discounted_regrets is None:
-            self.discounted_regrets = np.zeros(self.dimension)
+            self.discounted_regrets = np.zeros(
+                self.dimension,
+                dtype=FLOAT_DTYPE,
+            )
+        else:
+            self.discounted_regrets = np.asarray(
+                self.discounted_regrets,
+                dtype=FLOAT_DTYPE,
+            )
 
     def next_strategy(self, prediction=False):
         if prediction is False:
@@ -368,7 +446,7 @@ class BlumMansour(ProbabilitySimplexSwapRegretMinimizer):
         super().__post_init__()
 
         d = self.dimension
-        self.outputs = np.full((d, d), 1 / d)
+        self.outputs = np.full((d, d), 1 / d, dtype=FLOAT_DTYPE)
 
         if self.external_regret_minimizers is None:
             if self.regret_minimizer_factory is None:
@@ -388,7 +466,10 @@ class BlumMansour(ProbabilitySimplexSwapRegretMinimizer):
                     self.previous_strategy[a] * prediction,
                 )
 
-        strategy = stationary_distribution(self.outputs)
+        strategy = np.asarray(
+            stationary_distribution(self.outputs),
+            dtype=FLOAT_DTYPE,
+        )
 
         self.strategies.append(strategy)
 
@@ -587,7 +668,7 @@ class CartesianProductRegretCircuit(RegretCircuit):
         for R, m in zip(self.component_regret_minimizers, predictions):
             strategy.append(R.next_strategy(m))
 
-        strategy = np.concatenate(strategy)
+        strategy = np.asarray(np.concatenate(strategy), dtype=FLOAT_DTYPE)
 
         self.strategies.append(strategy)
 
@@ -633,10 +714,16 @@ class ConvexHullRegretCircuit(RegretCircuit):
         self.outputs = np.full(
             (len(self.component_regret_minimizers), self.dimension),
             1 / self.dimension,
+            dtype=FLOAT_DTYPE,
         )
 
         if self.previous_outputs is None:
             self.previous_outputs = self.outputs.copy()
+        else:
+            self.previous_outputs = np.asarray(
+                self.previous_outputs,
+                dtype=FLOAT_DTYPE,
+            )
 
         if self.mixing_regret_minimizer is None:
             if self.regret_minimizer_factory is None:
@@ -656,7 +743,10 @@ class ConvexHullRegretCircuit(RegretCircuit):
             m = self.previous_outputs @ prediction
 
         probabilities = self.mixing_regret_minimizer.next_strategy(m)
-        strategy = self.outputs.T @ probabilities
+        strategy = np.asarray(
+            self.outputs.T @ probabilities,
+            dtype=FLOAT_DTYPE,
+        )
 
         self.strategies.append(strategy)
 
@@ -774,7 +864,7 @@ class StochasticRegretMinimization(ABC):
                         probability * reference_reach_probability,
                     )
                 )
-                utilities = np.zeros(len(actions))
+                utilities = np.zeros(len(actions), dtype=FLOAT_DTYPE)
                 utilities[index] = utility
 
                 local_regret_minimizer.next_strategy()

@@ -19,6 +19,8 @@ from ordered_set import OrderedSet
 import numpy as np
 import numpy.linalg as LA
 
+FLOAT_DTYPE = np.float32
+
 
 def euclidean_projection_on_probability_simplex(input_):
     """Euclidean projection of the input on a probability simplex.
@@ -243,7 +245,11 @@ class TreeFormSequentialDecisionProcess(Serializable):
 
     def behavioral_uniform_strategy(self):
         strategy = {
-            j: np.full(len(self.actions[j]), 1 / len(self.actions[j]))
+            j: np.full(
+                len(self.actions[j]),
+                1 / len(self.actions[j]),
+                dtype=FLOAT_DTYPE,
+            )
             for j in self.decision_points
         }
 
@@ -279,12 +285,14 @@ class TreeFormSequentialDecisionProcess(Serializable):
             - root_value 是从根节点开始的最优价值。
         """
         strategy = {}  # 最优回应的行为策略：每个决策点 j -> 一个 one-hot 分布（选中的动作概率为 1）
-        V = defaultdict(int)  # 价值函数 V[p]：从节点 p 往后、在“最优回应/确定性展开规则”下的累积价值
+        V = defaultdict(
+            lambda: FLOAT_DTYPE(0),
+        )  # 价值函数 V[p]：从节点 p 往后、在“最优回应/确定性展开规则”下的累积价值
 
         for p in reversed(self.nodes):  # 自底向上（逆拓扑）做动态规划；保证 children 的 V 已经算好
             match self.node_types[p]:  # 根据节点类型分别处理
                 case self.NodeType.DECISION_POINT:
-                    V[p] = -inf  # 决策点取 max：先把当前最优值初始化成负无穷
+                    V[p] = FLOAT_DTYPE(-inf)  # 决策点取 max：先把当前最优值初始化成负无穷
                     index = None  # 记录使 V[p] 达到最大值的动作索引 i（对应 self.actions[p] 的枚举顺序）
 
                     for i, a in enumerate(self.actions[p]):  # 枚举该信息集/决策点 p 的每个动作 a
@@ -298,7 +306,10 @@ class TreeFormSequentialDecisionProcess(Serializable):
                             V[p] = value
                             index = i
 
-                    strategy[p] = np.zeros(len(self.actions[p]))  # one-hot：默认都不选
+                    strategy[p] = np.zeros(
+                        len(self.actions[p]),
+                        dtype=FLOAT_DTYPE,
+                    )  # one-hot：默认都不选
                     strategy[p][index] = 1  # 把最优动作对应位置置 1（确定性最优回应）
                 case self.NodeType.OBSERVATION_POINT:
                     # 观测点没有“我方决策”，表示观测/信号导致的信息集切分。
@@ -314,7 +325,7 @@ class TreeFormSequentialDecisionProcess(Serializable):
         return self.behavioral_to_sequence_form(strategy), value
 
     def behavioral_to_sequence_form(self, behavioral_strategy):
-        strategy = np.zeros(len(self.sequences))
+        strategy = np.zeros(len(self.sequences), dtype=FLOAT_DTYPE)
         strategy[self.sequences.index(())] = 1
 
         for j in self.decision_points:
@@ -372,7 +383,10 @@ class TreeFormSequentialDecisionProcess(Serializable):
         本函数返回的是 $Q(I,a)$（命名为 utilities[j][i]），以及未显式返回但可由
         上式组合得到的 $V(I)$。
         """
-        V = defaultdict(int)  # V[p]：在给定行为策略 π 下，从节点 p 往后的“期望/汇总”价值（用于计算 Q）
+        utility = np.asarray(utility, dtype=FLOAT_DTYPE)
+        V = defaultdict(
+            lambda: FLOAT_DTYPE(0),
+        )  # V[p]：在给定行为策略 π 下，从节点 p 往后的“期望/汇总”价值（用于计算 Q）
 
         for p in reversed(self.nodes):  # 同样自底向上；先算出每个节点的 V[p]
             match self.node_types[p]:  # 决策点：按 π 加权求期望；观测点：按分支求和
@@ -394,7 +408,10 @@ class TreeFormSequentialDecisionProcess(Serializable):
         utilities = {}  # 输出：每个决策点 j -> 每个动作的 Q(j,a)（反事实/局部动作价值）
 
         for j in self.decision_points:  # 逐个决策点（信息集）构造动作价值向量
-            utilities[j] = np.empty(len(self.actions[j]))  # utilities[j][i] 对应第 i 个动作的 Q 值
+            utilities[j] = np.empty(
+                len(self.actions[j]),
+                dtype=FLOAT_DTYPE,
+            )  # utilities[j][i] 对应第 i 个动作的 Q 值
 
             for i, a in enumerate(self.actions[j]):  # 枚举动作 a
                 # 这里返回 Q(j,a)=u(j,a)+V(next(j,a))；CFR 里常用它与 V(j) 形成遗憾 r(j,a)
@@ -421,5 +438,3 @@ class TreeFormSequentialDecisionProcess(Serializable):
     # Backward-compatible alias: older code (e.g. games.py) expects `to_list()`.
     def to_list(self):
         return self.serialize()
-
-

@@ -132,7 +132,7 @@ def persist_openspiel_game_per_agent(
     ] if check_hash_collisions and hash_infosets else []
 
     utilities_hashed: defaultdict[tuple, np.ndarray] = defaultdict(
-        lambda: np.zeros(player_count, dtype=float),
+        lambda: np.zeros(player_count, dtype=np.float32),
     )
 
     init_sequences: list[tuple] = [()] * player_count
@@ -330,7 +330,7 @@ def persist_openspiel_game_per_agent(
     # Map utilities keyed by hashed sequences to utilities keyed by internal TFSDP
     # sequence edges (node_id, event_id), without re-walking the OpenSpiel tree.
     utilities: defaultdict[tuple, np.ndarray] = defaultdict(
-        lambda: np.zeros(player_count, dtype=float),
+        lambda: np.zeros(player_count, dtype=np.float32),
     )
 
     for hashed_sequences, vals in utilities_hashed.items():
@@ -401,12 +401,12 @@ def persist_openspiel_game_per_agent(
         nnz = len(utilities)
         rows = np.empty(nnz, dtype=np.int64)
         cols = np.empty(nnz, dtype=np.int64)
-        data = np.empty(nnz, dtype=float)
+        data = np.empty(nnz, dtype=np.float32)
 
         for k, ((s0, s1), vals) in enumerate(utilities.items()):
             rows[k] = int(seq_index[0][s0])
             cols[k] = int(seq_index[1][s1])
-            data[k] = float(vals[0])
+            data[k] = np.float32(vals[0])
 
         m = csr_array((data, (rows, cols)), shape=shape)
         raw_utilities = {
@@ -438,12 +438,12 @@ def persist_openspiel_game_per_agent(
 
         nnz = len(items)
         coords = np.empty((nnz, player_count), dtype=np.int64)
-        values_dense = np.empty((player_count, nnz), dtype=float)
+        values_dense = np.empty((player_count, nnz), dtype=np.float32)
 
         for k, (seqs, vals) in enumerate(items):
             for p in range(player_count):
                 coords[k, p] = int(seq_index[p][seqs[p]])
-                values_dense[p, k] = float(vals[p])
+                values_dense[p, k] = np.float32(vals[p])
 
         indptr = np.arange(nnz + 1, dtype=np.int64)
         indices = np.zeros(nnz, dtype=np.int32)
@@ -617,12 +617,12 @@ def load_openspiel_game_per_agent(
                     raise ValueError('unexpected sparse vector shape')
                 indptr = payload['indptr']
                 data = payload['data']
-                out = np.zeros(length, dtype=float)
+                out = np.zeros(length, dtype=np.float32)
                 for i in range(length):
                     start = indptr[i]
                     end = indptr[i + 1]
                     if end > start:
-                        out[i] = float(data[start])
+                        out[i] = np.float32(data[start])
                 return out
 
             nnz = int(coords.shape[0])
