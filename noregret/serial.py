@@ -547,6 +547,7 @@ def load_openspiel_game_per_agent(
         path: str | os.PathLike,
         *,
         restore_raw_utilities: bool = False,
+        vectorized_raw_restore: bool = True,
         debug: bool = False,
 ) -> dict[str, Any]:
     """Load a bundle written by persist_openspiel_game_per_agent()."""
@@ -643,14 +644,19 @@ def load_openspiel_game_per_agent(
                 shape = tuple(payload['shape'])
                 if shape != (length, 1):
                     raise ValueError('unexpected sparse vector shape')
-                indptr = payload['indptr']
-                data = payload['data']
+                indptr = np.asarray(payload['indptr'], dtype=np.int64)
+                data = np.asarray(payload['data'], dtype=np.float32)
                 out = np.zeros(length, dtype=np.float32)
-                for i in range(length):
-                    start = indptr[i]
-                    end = indptr[i + 1]
-                    if end > start:
-                        out[i] = np.float32(data[start])
+                if vectorized_raw_restore:
+                    row_nnz = indptr[1:] > indptr[:-1]
+                    if bool(row_nnz.any()):
+                        out[row_nnz] = data[indptr[:-1][row_nnz]]
+                else:
+                    for i in range(length):
+                        start = indptr[i]
+                        end = indptr[i + 1]
+                        if end > start:
+                            out[i] = np.float32(data[start])
                 return out
 
             nnz = int(coords.shape[0])
