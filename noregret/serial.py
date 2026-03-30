@@ -60,6 +60,7 @@ def persist_openspiel_game_per_agent(
     check_hash_collisions: bool = False,
     compress: bool = False,
     sort_utilities: bool = False,
+    emit_policy_specs: bool = True,
     debug: bool = False,
 ) -> Path:
     """Persist an OpenSpiel extensive-form game in a template-compatible schema.
@@ -97,6 +98,7 @@ def persist_openspiel_game_per_agent(
         check_hash_collisions=bool(check_hash_collisions),
         sort_utilities=bool(sort_utilities),
         compress=bool(compress),
+        emit_policy_specs=bool(emit_policy_specs),
     )
 
     def _state_key_from_infoset(infoset_str: str) -> Any:
@@ -124,6 +126,12 @@ def persist_openspiel_game_per_agent(
     actions: list[dict[int, OrderedSet]] = [
         {} for _ in range(player_count)
     ]
+    infoset_order: list[list[Any]] = [
+        [] for _ in range(player_count)
+    ]
+    infoset_labels: list[dict[Any, str]] = [
+        {} for _ in range(player_count)
+    ] if emit_policy_specs else []
 
     # Optional: store original information state strings for collision detection.
     # Disabled by default because it can be memory-heavy on large games.
@@ -195,7 +203,11 @@ def persist_openspiel_game_per_agent(
 
         parent_sequence = sequences[player]
         children[player].setdefault(parent_sequence, OrderedSet()).add(infoset)
-        actions[player].setdefault(infoset, OrderedSet())
+        if infoset not in actions[player]:
+            actions[player][infoset] = OrderedSet()
+            infoset_order[player].append(infoset)
+            if infoset_labels:
+                infoset_labels[player][infoset] = infoset_str
 
         # Match recursive DFS order: record children in legal_actions order, then
         # push to stack in reverse.
@@ -480,15 +492,30 @@ def persist_openspiel_game_per_agent(
         'utilities': raw_utilities,
         'meta': {
             'format': 'nogret.openspiel.game.per_agent',
-            'version': 4,
+            'version': 5 if emit_policy_specs else 4,
             'player_count': player_count,
             'hash_digest_size': hash_digest_size,
             'hash_infosets': bool(hash_infosets),
             'check_hash_collisions': bool(check_hash_collisions),
             'sort_utilities': bool(sort_utilities),
             'zero_sum': bool(zero_sum),
+            'emit_policy_specs': bool(emit_policy_specs),
         },
     }
+    if emit_policy_specs:
+        raw_game['policy_specs'] = [
+            {
+                'infosets': [
+                    infoset_labels[p][infoset]
+                    for infoset in infoset_order[p]
+                ],
+                'actions': [
+                    list(actions[p].get(infoset, OrderedSet()))
+                    for infoset in infoset_order[p]
+                ],
+            }
+            for p in range(player_count)
+        ]
 
     suffix = '.pkl.gz' if compress else '.pkl'
     out_file = out_path / f'{file_prefix}{suffix}'
