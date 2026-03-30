@@ -546,6 +546,7 @@ def persist_openspiel_game_per_agent(
 def load_openspiel_game_per_agent(
         path: str | os.PathLike,
         *,
+        restore_raw_utilities: bool = False,
         debug: bool = False,
 ) -> dict[str, Any]:
     """Load a bundle written by persist_openspiel_game_per_agent()."""
@@ -690,13 +691,16 @@ def load_openspiel_game_per_agent(
             player_count=meta.get('player_count', 'NA'),
             utilities_kind=utilities.get('kind', 'NA'),
         )
-        obj = _restore_raw_utilities(obj)
-        if isinstance(obj, dict) and 'raw_utilities' in obj:
-            _dprint(
-                debug,
-                'Utilities restored to raw list',
-                raw_len=int(len(obj.get('raw_utilities', []))),
-            )
+        if restore_raw_utilities:
+            obj = _restore_raw_utilities(obj)
+            if isinstance(obj, dict) and 'raw_utilities' in obj:
+                _dprint(
+                    debug,
+                    'Utilities restored to raw list',
+                    raw_len=int(len(obj.get('raw_utilities', []))),
+                )
+        else:
+            _dprint(debug, 'Skipped raw utility restoration')
     _dprint(debug, 'load_openspiel_game_per_agent: done')
     return obj
 
