@@ -19,6 +19,11 @@ from ordered_set import OrderedSet
 import numpy as np
 import numpy.linalg as LA
 
+from noregret.pbs_passive_compiler import (
+    can_direct_compile_pbs_passive,
+    direct_compiler_eligibility_reason,
+    discover_pbs_passive_direct,
+)
 from noregret.utilities import *
 from pyspiel import GameType, SpielError
 
@@ -49,59 +54,21 @@ def _dprint(enabled: bool, msg: str, **meta: Any) -> None:
         print(f'[nogret.serial] {msg}', flush=True)
 
 
-
-def persist_openspiel_game_per_agent(
-    game: Any,
-    out_dir: str | os.PathLike,
+def _make_state_key_from_infoset(
     *,
-    file_prefix: str = 'openspiel_game',
-    hash_digest_size: int = 8,
-    hash_infosets: bool = True,
-    check_hash_collisions: bool = False,
-    compress: bool = False,
-    sort_utilities: bool = False,
-    emit_policy_specs: bool = True,
-    debug: bool = False,
-) -> Path:
-    """Persist an OpenSpiel extensive-form game in a template-compatible schema.
-
-    This mirrors the JSON structure produced by `scripts/from-open-spiel.py`:
-
-    - `tree_form_sequential_decision_processes`: list[ list[transition] ] (one per player)
-    - `utilities`: sparse list of terminal utilities keyed by per-player sequences
-
-    but uses a more compact encoding:
-    - decision points are hashed integers (via blake2b of information state strings)
-    - actions are OpenSpiel action ids (integers)
-    - observation points / END nodes are still represented in the TFSDP tree
-
-    The output is pickled as `{file_prefix}.pkl[.gz]` in `out_dir`.
-    """
-  
-
-    out_path = Path(out_dir)
-    out_path.mkdir(parents=True, exist_ok=True)
-
+    player_count: int,
+    hash_infosets: bool,
+    hash_digest_size: int,
+    check_hash_collisions: bool,
+):
     if hash_infosets and hash_digest_size < 8:
         raise ValueError('hash_digest_size must be >= 8 bytes')
 
-    player_count = game.num_players()
+    infoset_strings: list[dict[Any, str]] = [
+        {} for _ in range(player_count)
+    ] if check_hash_collisions and hash_infosets else []
 
-    _dprint(
-        debug,
-        'persist_openspiel_game_per_agent: start',
-        out_dir=str(out_path),
-        file_prefix=file_prefix,
-        player_count=int(player_count),
-        hash_digest_size=int(hash_digest_size),
-        hash_infosets=bool(hash_infosets),
-        check_hash_collisions=bool(check_hash_collisions),
-        sort_utilities=bool(sort_utilities),
-        compress=bool(compress),
-        emit_policy_specs=bool(emit_policy_specs),
-    )
-
-    def _state_key_from_infoset(infoset_str: str) -> Any:
+    def _state_key_from_infoset(player: int, infoset_str: str) -> Any:
         if not hash_infosets:
             return infoset_str
 
@@ -110,16 +77,30 @@ def persist_openspiel_game_per_agent(
             digest_size=hash_digest_size,
             person=b'history',
         ).digest()
-        return int.from_bytes(digest, 'big', signed=False)
+        infoset = int.from_bytes(digest, 'big', signed=False)
 
-    # DFS over the OpenSpiel tree (pre-order), matching `scripts/from-open-spiel.py`:
-    # - preserve encounter order of infosets under each parent sequence
-    # - preserve OpenSpiel's `legal_actions()` order per infoset
-    # - accumulate terminal utilities (expected over chance)
-    #
-    # IMPORTANT: downstream TFSDP logic assumes a topologically sorted / DFS-like
-    # ordering of transitions. We therefore carry encounter order through the
-    # whole pipeline and avoid sorting.
+        if infoset_strings:
+            prev = infoset_strings[player].get(infoset)
+            if prev is None:
+                infoset_strings[player][infoset] = infoset_str
+            elif prev != infoset_str:
+                raise ValueError(
+                    'Information state hash collision detected; increase hash_digest_size.',
+                )
+
+        return infoset
+
+    return _state_key_from_infoset
+
+
+def _discover_game_via_state_dfs(
+    game: Any,
+    *,
+    emit_policy_specs: bool,
+    state_key_from_infoset,
+    debug: bool,
+) -> dict[str, Any]:
+    player_count = game.num_players()
     children: list[dict[tuple, OrderedSet]] = [
         {(): OrderedSet()} for _ in range(player_count)
     ]
@@ -133,12 +114,6 @@ def persist_openspiel_game_per_agent(
         {} for _ in range(player_count)
     ] if emit_policy_specs else []
 
-    # Optional: store original information state strings for collision detection.
-    # Disabled by default because it can be memory-heavy on large games.
-    infoset_strings: list[dict[Any, str]] = [
-        {} for _ in range(player_count)
-    ] if check_hash_collisions and hash_infosets else []
-
     utilities_hashed: defaultdict[tuple, np.ndarray] = defaultdict(
         lambda: np.zeros(player_count, dtype=np.float32),
     )
@@ -148,7 +123,6 @@ def persist_openspiel_game_per_agent(
         (game.new_initial_state(), 1.0, init_sequences),
     ]
 
-    # Lightweight traversal stats for debugging.
     expanded_states = 0
     terminal_states = 0
     chance_states = 0
@@ -163,7 +137,6 @@ def persist_openspiel_game_per_agent(
 
         if state.is_terminal():
             terminal_states += 1
-            # Hot path: avoid allocating a new NumPy array per terminal.
             acc = utilities_hashed[tuple(sequences)]
             rewards = state.rewards()
             for i in range(player_count):
@@ -172,7 +145,6 @@ def persist_openspiel_game_per_agent(
 
         if state.is_chance_node():
             chance_states += 1
-            # Match recursive DFS order: iterate outcomes in the given order.
             frames: list[tuple[Any, float, list[tuple]]] = []
             for action, prob in state.chance_outcomes():
                 frames.append((
@@ -180,7 +152,6 @@ def persist_openspiel_game_per_agent(
                     chance_prob * float(prob),
                     sequences,
                 ))
-            # LIFO stack -> push reversed so first outcome is processed first.
             stack.extend(reversed(frames))
             continue
 
@@ -191,16 +162,7 @@ def persist_openspiel_game_per_agent(
         except SpielError:
             infoset_str = state.history_str() if hasattr(state, 'history_str') else str(state)
 
-        infoset = _state_key_from_infoset(infoset_str)
-        if infoset_strings:
-            prev = infoset_strings[player].get(infoset)
-            if prev is None:
-                infoset_strings[player][infoset] = infoset_str
-            elif prev != infoset_str:
-                raise ValueError(
-                    'Information state hash collision detected; increase hash_digest_size.',
-                )
-
+        infoset = state_key_from_infoset(player, infoset_str)
         parent_sequence = sequences[player]
         children[player].setdefault(parent_sequence, OrderedSet()).add(infoset)
         if infoset not in actions[player]:
@@ -209,8 +171,6 @@ def persist_openspiel_game_per_agent(
             if infoset_labels:
                 infoset_labels[player][infoset] = infoset_str
 
-        # Match recursive DFS order: record children in legal_actions order, then
-        # push to stack in reverse.
         frames = []
         for action in state.legal_actions():
             a = int(action)
@@ -235,8 +195,32 @@ def persist_openspiel_game_per_agent(
         max_stack=int(max_stack),
     )
 
-    # 2) Build per-player TFSDPs using the existing compact encoding
-    #    (contiguous decision ids + per-node event ids).
+    return {
+        'player_count': player_count,
+        'children': children,
+        'actions': actions,
+        'infoset_order': infoset_order,
+        'infoset_labels': infoset_labels,
+        'utilities_hashed': utilities_hashed,
+    }
+
+
+def _build_raw_game_from_discovery(
+    game: Any,
+    *,
+    player_count: int,
+    children: list[dict[tuple, OrderedSet]],
+    actions: list[dict[Any, OrderedSet]],
+    infoset_order: list[list[Any]],
+    infoset_labels: list[dict[Any, str]],
+    utilities_hashed: defaultdict[tuple, np.ndarray],
+    emit_policy_specs: bool,
+    hash_digest_size: int,
+    hash_infosets: bool,
+    check_hash_collisions: bool,
+    sort_utilities: bool,
+    debug: bool,
+) -> dict[str, Any]:
     decision_ids: list[dict[int, int]] = []
     action_event_ids: list[dict[int, dict[int, int]]] = []
     tfsdps: list[TreeFormSequentialDecisionProcess] = []
@@ -244,8 +228,6 @@ def persist_openspiel_game_per_agent(
     for p in range(player_count):
         children_map = children[p]
         actions_map = actions[p]
-
-        # Preserve encounter order (DFS) for decision points and per-infoset actions.
         infosets = list(actions_map.keys())
         decision_id = {h: i for i, h in enumerate(infosets)}
 
@@ -277,8 +259,6 @@ def persist_openspiel_game_per_agent(
             obs_id = obs_next
             obs_next += 1
             node_types[obs_id] = TreeFormSequentialDecisionProcess.NodeType.OBSERVATION_POINT
-
-            # Preserve encounter order within this observation split.
             pending_obs_children[obs_id] = [decision_id[h] for h in next_infosets]
             return obs_id
 
@@ -319,7 +299,6 @@ def persist_openspiel_game_per_agent(
         decision_ids.append(decision_id)
         action_event_ids.append(action_event_id)
 
-        # Per-player TFSDP summary.
         try:
             seq_count = len(tfsdps[-1].sequences)
         except Exception:
@@ -339,8 +318,6 @@ def persist_openspiel_game_per_agent(
             transitions=int(len(transitions)),
         )
 
-    # Map utilities keyed by hashed sequences to utilities keyed by internal TFSDP
-    # sequence edges (node_id, event_id), without re-walking the OpenSpiel tree.
     utilities: defaultdict[tuple, np.ndarray] = defaultdict(
         lambda: np.zeros(player_count, dtype=np.float32),
     )
@@ -365,17 +342,11 @@ def persist_openspiel_game_per_agent(
         shape=tuple(int(x) for x in (tuple(len(t.sequences) for t in tfsdps))),
     )
 
-    # Serialize utilities in the same sparse list style as the template.
     zero_sum = (
         player_count == 2
         and game.get_type().utility == GameType.Utility.ZERO_SUM
     )
 
-    # Persist utilities in a packed sparse representation.
-    # - 2-player ZERO_SUM: store a single payoff matrix as SciPy CSR (float).
-    # - Otherwise: store a sparse list of nonzero profiles (coords) plus one
-    #   SciPy CSR sparse vector (nnz x 1) per player (float). This avoids tuple
-    #   payloads and works uniformly for 2-player general-sum and n-player games.
     raw_utilities: Any
     shape = tuple(len(t.sequences) for t in tfsdps)
     seq_index = [
@@ -401,8 +372,6 @@ def persist_openspiel_game_per_agent(
         }
 
     if zero_sum:
-        # Keep the special-case compact matrix representation.
-        # Avoid slow Python-level LIL assignment by building CSR from COO in SciPy.
         try:
             from scipy.sparse import csr_array  # type: ignore
         except Exception as e:  # pragma: no cover
@@ -440,10 +409,6 @@ def persist_openspiel_game_per_agent(
             nnz=int(m.nnz),
         )
     else:
-        # Unified representation: sparse profiles + per-player value vectors.
-        # Coords is (nnz, player_count) of per-player sequence indices.
-        # We emit CSR payloads directly (shape=(nnz,1)) to avoid constructing SciPy LIL
-        # objects in Python.
         items = list(utilities.items())
         if sort_utilities:
             items.sort(key=lambda kv: kv[0])
@@ -517,6 +482,135 @@ def persist_openspiel_game_per_agent(
             for p in range(player_count)
         ]
 
+    return raw_game
+
+
+
+def persist_openspiel_game_per_agent(
+    game: Any,
+    out_dir: str | os.PathLike,
+    *,
+    file_prefix: str = 'openspiel_game',
+    hash_digest_size: int = 8,
+    hash_infosets: bool = True,
+    check_hash_collisions: bool = False,
+    compress: bool = False,
+    sort_utilities: bool = False,
+    emit_policy_specs: bool = True,
+    compiler: str = 'dfs',
+    debug: bool = False,
+) -> Path:
+    """Persist an OpenSpiel extensive-form game in a template-compatible schema.
+
+    This mirrors the JSON structure produced by `scripts/from-open-spiel.py`:
+
+    - `tree_form_sequential_decision_processes`: list[ list[transition] ] (one per player)
+    - `utilities`: sparse list of terminal utilities keyed by per-player sequences
+
+    but uses a more compact encoding:
+    - decision points are hashed integers (via blake2b of information state strings)
+    - actions are OpenSpiel action ids (integers)
+    - observation points / END nodes are still represented in the TFSDP tree
+
+    The output is pickled as `{file_prefix}.pkl[.gz]` in `out_dir`.
+    """
+  
+
+    out_path = Path(out_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+
+    player_count = int(game.num_players())
+    state_key_from_infoset = _make_state_key_from_infoset(
+        player_count=player_count,
+        hash_infosets=bool(hash_infosets),
+        hash_digest_size=int(hash_digest_size),
+        check_hash_collisions=bool(check_hash_collisions),
+    )
+
+    compiler_requested = str(compiler)
+    compiler_used = 'openspiel_dfs'
+    compiler_fallback_reason: str | None = None
+
+    _dprint(
+        debug,
+        'persist_openspiel_game_per_agent: start',
+        out_dir=str(out_path),
+        file_prefix=file_prefix,
+        player_count=int(player_count),
+        hash_digest_size=int(hash_digest_size),
+        hash_infosets=bool(hash_infosets),
+        check_hash_collisions=bool(check_hash_collisions),
+        sort_utilities=bool(sort_utilities),
+        compress=bool(compress),
+        emit_policy_specs=bool(emit_policy_specs),
+        compiler=compiler_requested,
+    )
+
+    if compiler_requested not in {'dfs', 'auto', 'pbs_passive_direct'}:
+        raise ValueError(f'unsupported compiler mode: {compiler_requested!r}')
+
+    if compiler_requested == 'dfs':
+        discovery = _discover_game_via_state_dfs(
+            game,
+            emit_policy_specs=bool(emit_policy_specs),
+            state_key_from_infoset=state_key_from_infoset,
+            debug=bool(debug),
+        )
+    elif compiler_requested == 'pbs_passive_direct':
+        discovery = discover_pbs_passive_direct(
+            game,
+            emit_policy_specs=bool(emit_policy_specs),
+            state_key_from_infoset=state_key_from_infoset,
+        ).__dict__
+        compiler_used = 'pbs_passive_direct'
+    else:
+        if can_direct_compile_pbs_passive(game):
+            discovery = discover_pbs_passive_direct(
+                game,
+                emit_policy_specs=bool(emit_policy_specs),
+                state_key_from_infoset=state_key_from_infoset,
+            ).__dict__
+            compiler_used = 'pbs_passive_direct'
+        else:
+            compiler_fallback_reason = direct_compiler_eligibility_reason(game)
+            discovery = _discover_game_via_state_dfs(
+                game,
+                emit_policy_specs=bool(emit_policy_specs),
+                state_key_from_infoset=state_key_from_infoset,
+                debug=bool(debug),
+            )
+
+    if compiler_used == 'pbs_passive_direct':
+        stats = discovery.get('stats', {})
+        _dprint(
+            debug,
+            'Direct compiler finished',
+            valuation_outcomes=stats.get('valuation_outcomes', 'NA'),
+            expanded_frames=stats.get('expanded_frames', 'NA'),
+            terminal_histories=stats.get('terminal_histories', 'NA'),
+            utility_profiles=stats.get('utility_profiles', 'NA'),
+        )
+
+    raw_game = _build_raw_game_from_discovery(
+        game,
+        player_count=int(discovery['player_count']),
+        children=discovery['children'],
+        actions=discovery['actions'],
+        infoset_order=discovery['infoset_order'],
+        infoset_labels=discovery['infoset_labels'],
+        utilities_hashed=discovery['utilities_hashed'],
+        emit_policy_specs=bool(emit_policy_specs),
+        hash_digest_size=int(hash_digest_size),
+        hash_infosets=bool(hash_infosets),
+        check_hash_collisions=bool(check_hash_collisions),
+        sort_utilities=bool(sort_utilities),
+        debug=bool(debug),
+    )
+    raw_game['meta']['compiler_requested'] = compiler_requested
+    raw_game['meta']['compiler_used'] = compiler_used
+    if compiler_fallback_reason is not None:
+        raw_game['meta']['compiler_fallback_reason'] = compiler_fallback_reason
+
     suffix = '.pkl.gz' if compress else '.pkl'
     out_file = out_path / f'{file_prefix}{suffix}'
     tmp = out_file.with_suffix(out_file.suffix + '.tmp')
@@ -538,6 +632,7 @@ def persist_openspiel_game_per_agent(
         'persist_openspiel_game_per_agent: done',
         out_file=str(out_file),
         file_size=_fmt_bytes(size_b),
+        compiler_used=compiler_used,
     )
 
     return out_file
