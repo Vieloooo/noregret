@@ -59,6 +59,81 @@ def _dprint(enabled: bool, msg: str, **meta: Any) -> None:
         print(f'[nogret.serial] {msg}', flush=True)
 
 
+class _ProfilePerPlayerRowSink:
+    """Append-only sink for packed sparse utility profile rows."""
+
+    def append(self, coords_row: list[int], values_row: np.ndarray) -> None:
+        raise NotImplementedError
+
+    def finalize(self) -> dict[str, Any]:
+        raise NotImplementedError
+
+
+class _InMemoryProfilePerPlayerRowSink(_ProfilePerPlayerRowSink):
+    """In-memory row sink that preserves the current packed bundle schema."""
+
+    def __init__(
+        self,
+        *,
+        row_count: int,
+        player_count: int,
+        coord_dtype: np.dtype = np.int64,
+        value_dtype: np.dtype = np.float32,
+    ) -> None:
+        self._row_count = int(row_count)
+        self._player_count = int(player_count)
+        self._coords = np.empty((self._row_count, self._player_count), dtype=coord_dtype)
+        self._values = [
+            np.empty(self._row_count, dtype=value_dtype)
+            for _ in range(self._player_count)
+        ]
+        self._cursor = 0
+
+    def append(self, coords_row: list[int], values_row: np.ndarray) -> None:
+        row_idx = int(self._cursor)
+        if row_idx >= self._row_count:
+            raise ValueError('utility row sink capacity exceeded')
+        if len(coords_row) != self._player_count:
+            raise ValueError('coords_row does not match player_count')
+        if len(values_row) != self._player_count:
+            raise ValueError('values_row does not match player_count')
+
+        self._coords[row_idx, :] = coords_row
+        for p in range(self._player_count):
+            self._values[p][row_idx] = np.float32(values_row[p])
+        self._cursor = row_idx + 1
+
+    def finalize(self) -> dict[str, Any]:
+        nnz = int(self._cursor)
+        if nnz != self._row_count:
+            coords = self._coords[:nnz].copy()
+            values = [self._values[p][:nnz].copy() for p in range(self._player_count)]
+        else:
+            coords = self._coords
+            values = self._values
+
+        indptr = np.arange(nnz + 1, dtype=np.int64)
+        indices = np.zeros(nnz, dtype=np.int32)
+        payloads = [
+            {
+                'type': 'csr',
+                'shape': (nnz, 1),
+                'dtype': str(values[p].dtype),
+                'data': values[p],
+                'indices': indices,
+                'indptr': indptr,
+            }
+            for p in range(self._player_count)
+        ]
+        return {
+            'kind': 'scipy.sparse.profile_per_player',
+            'player_count': int(self._player_count),
+            'zero_sum': False,
+            'coords': coords,
+            'values': payloads,
+        }
+
+
 def _make_state_key_from_infoset(
     *,
     player_count: int,
@@ -425,46 +500,27 @@ def _build_raw_game_from_discovery(
             items.sort(key=lambda kv: kv[0])
 
         nnz = len(utilities)
-        coords = np.empty((nnz, player_count), dtype=np.int64)
-        values_by_player = [
-            np.empty(nnz, dtype=np.float32)
-            for _ in range(player_count)
-        ]
+        row_sink = _InMemoryProfilePerPlayerRowSink(
+            row_count=nnz,
+            player_count=player_count,
+            coord_dtype=np.int64,
+            value_dtype=np.float32,
+        )
 
-        for k, (seqs, vals) in enumerate(items):
-            for p in range(player_count):
-                coords[k, p] = int(seq_index[p][seqs[p]])
-                values_by_player[p][k] = np.float32(vals[p])
+        for seqs, vals in items:
+            coords_row = [int(seq_index[p][seqs[p]]) for p in range(player_count)]
+            row_sink.append(coords_row, np.asarray(vals, dtype=np.float32))
         utilities.clear()
         if sort_utilities:
             items.clear()
 
-        indptr = np.arange(nnz + 1, dtype=np.int64)
-        indices = np.zeros(nnz, dtype=np.int32)
-        payloads = [
-            _pack_csr_parts(
-                shape_=(nnz, 1),
-                dtype_=str(values_by_player[p].dtype),
-                data=values_by_player[p],
-                indices=indices,
-                indptr=indptr,
-            )
-            for p in range(player_count)
-        ]
-
-        raw_utilities = {
-            'kind': 'scipy.sparse.profile_per_player',
-            'player_count': int(player_count),
-            'zero_sum': False,
-            'coords': coords,
-            'values': payloads,
-        }
+        raw_utilities = row_sink.finalize()
         nnz_each = [int(nnz)] * player_count
         _dprint(
             debug,
             'Packed utilities (profile_per_player)',
             nnz=int(nnz),
-            coords_shape=tuple(int(x) for x in coords.shape),
+            coords_shape=tuple(int(x) for x in raw_utilities['coords'].shape),
             per_player_vec_nnz=nnz_each,
         )
 
