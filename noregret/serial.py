@@ -303,6 +303,7 @@ def _build_raw_game_from_discovery(
         tfsdps.append(TreeFormSequentialDecisionProcess(transitions, node_types))
         decision_ids.append(decision_id)
         action_event_ids.append(action_event_id)
+        children_map.clear()
 
         try:
             seq_count = len(tfsdps[-1].sequences)
@@ -339,6 +340,9 @@ def _build_raw_game_from_discovery(
             internal_sequences.append((nid, eid))
 
         utilities[tuple(internal_sequences)] += vals
+    utilities_hashed.clear()
+    decision_ids = []
+    action_event_ids = []
 
     _dprint(
         debug,
@@ -393,6 +397,7 @@ def _build_raw_game_from_discovery(
             rows[k] = int(seq_index[0][s0])
             cols[k] = int(seq_index[1][s1])
             data[k] = np.float32(vals[0])
+        utilities.clear()
 
         m = csr_array((data, (rows, cols)), shape=shape)
         raw_utilities = {
@@ -414,26 +419,33 @@ def _build_raw_game_from_discovery(
             nnz=int(m.nnz),
         )
     else:
-        items = list(utilities.items())
+        items: Any = utilities.items()
         if sort_utilities:
+            items = list(items)
             items.sort(key=lambda kv: kv[0])
 
-        nnz = len(items)
+        nnz = len(utilities)
         coords = np.empty((nnz, player_count), dtype=np.int64)
-        values_dense = np.empty((player_count, nnz), dtype=np.float32)
+        values_by_player = [
+            np.empty(nnz, dtype=np.float32)
+            for _ in range(player_count)
+        ]
 
         for k, (seqs, vals) in enumerate(items):
             for p in range(player_count):
                 coords[k, p] = int(seq_index[p][seqs[p]])
-                values_dense[p, k] = np.float32(vals[p])
+                values_by_player[p][k] = np.float32(vals[p])
+        utilities.clear()
+        if sort_utilities:
+            items.clear()
 
         indptr = np.arange(nnz + 1, dtype=np.int64)
         indices = np.zeros(nnz, dtype=np.int32)
         payloads = [
             _pack_csr_parts(
                 shape_=(nnz, 1),
-                dtype_=str(values_dense.dtype),
-                data=values_dense[p].copy(),
+                dtype_=str(values_by_player[p].dtype),
+                data=values_by_player[p],
                 indices=indices,
                 indptr=indptr,
             )
@@ -631,6 +643,7 @@ def persist_openspiel_game_per_agent(
     raw_game['meta']['compiler_used'] = compiler_used
     if compiler_fallback_reason is not None:
         raw_game['meta']['compiler_fallback_reason'] = compiler_fallback_reason
+    discovery.clear()
 
     suffix = '.pkl.gz' if compress else '.pkl'
     out_file = out_path / f'{file_prefix}{suffix}'
