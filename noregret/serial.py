@@ -19,6 +19,11 @@ from ordered_set import OrderedSet
 import numpy as np
 import numpy.linalg as LA
 
+from noregret.epbs_vanilla_compiler import (
+    can_direct_compile_epbs_vanilla,
+    direct_compiler_eligibility_reason as epbs_vanilla_direct_compiler_eligibility_reason,
+    discover_epbs_vanilla_direct,
+)
 from noregret.pbs_passive_compiler import (
     can_direct_compile_pbs_passive,
     direct_compiler_eligibility_reason,
@@ -546,7 +551,7 @@ def persist_openspiel_game_per_agent(
         compiler=compiler_requested,
     )
 
-    if compiler_requested not in {'dfs', 'auto', 'pbs_passive_direct'}:
+    if compiler_requested not in {'dfs', 'auto', 'pbs_passive_direct', 'epbs_vanilla_direct'}:
         raise ValueError(f'unsupported compiler mode: {compiler_requested!r}')
 
     if compiler_requested == 'dfs':
@@ -563,6 +568,13 @@ def persist_openspiel_game_per_agent(
             state_key_from_infoset=state_key_from_infoset,
         ).__dict__
         compiler_used = 'pbs_passive_direct'
+    elif compiler_requested == 'epbs_vanilla_direct':
+        discovery = discover_epbs_vanilla_direct(
+            game,
+            emit_policy_specs=bool(emit_policy_specs),
+            state_key_from_infoset=state_key_from_infoset,
+        ).__dict__
+        compiler_used = 'epbs_vanilla_direct'
     else:
         if can_direct_compile_pbs_passive(game):
             discovery = discover_pbs_passive_direct(
@@ -571,8 +583,17 @@ def persist_openspiel_game_per_agent(
                 state_key_from_infoset=state_key_from_infoset,
             ).__dict__
             compiler_used = 'pbs_passive_direct'
+        elif can_direct_compile_epbs_vanilla(game):
+            discovery = discover_epbs_vanilla_direct(
+                game,
+                emit_policy_specs=bool(emit_policy_specs),
+                state_key_from_infoset=state_key_from_infoset,
+            ).__dict__
+            compiler_used = 'epbs_vanilla_direct'
         else:
-            compiler_fallback_reason = direct_compiler_eligibility_reason(game)
+            pbs_reason = direct_compiler_eligibility_reason(game)
+            epbs_reason = epbs_vanilla_direct_compiler_eligibility_reason(game)
+            compiler_fallback_reason = epbs_reason if epbs_reason is not None and pbs_reason and "unsupported game short_name" in pbs_reason else pbs_reason
             discovery = _discover_game_via_state_dfs(
                 game,
                 emit_policy_specs=bool(emit_policy_specs),
@@ -580,7 +601,7 @@ def persist_openspiel_game_per_agent(
                 debug=bool(debug),
             )
 
-    if compiler_used == 'pbs_passive_direct':
+    if compiler_used in {'pbs_passive_direct', 'epbs_vanilla_direct'}:
         stats = discovery.get('stats', {})
         _dprint(
             debug,
