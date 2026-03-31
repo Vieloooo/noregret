@@ -115,9 +115,6 @@ def discover_epbs_vanilla_direct(
     actions: list[dict[Any, OrderedSet]] = [{} for _ in range(player_count)]
     infoset_order: list[list[Any]] = [[] for _ in range(player_count)]
     infoset_labels: list[dict[Any, str]] = [{} for _ in range(player_count)] if emit_policy_specs else []
-    utilities_hashed: defaultdict[tuple, np.ndarray] = defaultdict(
-        lambda: np.zeros(player_count, dtype=np.float32),
-    )
 
     def _submasks(mask: int):
         submask = int(mask)
@@ -231,15 +228,15 @@ def discover_epbs_vanilla_direct(
         upto_stage_mask = (1 << int(stage)) - 1
         return upto_stage_mask & ~_scheduled_mask(message_masks)
 
-    def _accumulate_terminal_payoffs(
-        acc: np.ndarray,
+    def _terminal_payoffs(
         valuation_prob: float,
         terminal_stage: int,
         v0: int,
         v1: int,
         bids0: tuple[int, ...],
         bids1: tuple[int, ...],
-    ) -> None:
+    ) -> np.ndarray:
+        acc = np.zeros(player_count, dtype=np.float32)
         stage_idx = int(terminal_stage) - 1
         stage_bids = (int(bids0[stage_idx]), int(bids1[stage_idx]))
         stage_bid_vals = (bid_levels[stage_bids[0]], bid_levels[stage_bids[1]])
@@ -257,6 +254,7 @@ def discover_epbs_vanilla_direct(
             split = float(len(winners))
             for winner in winners:
                 acc[1 + winner] += scale * float(val_vals[winner] - stage_bid_vals[winner]) / split
+        return acc
 
     valuation_outcomes = nv ** num_builders
     terminal_histories = 0
@@ -311,15 +309,6 @@ def discover_epbs_vanilla_direct(
 
                     if stage == num_stages:
                         terminal_histories += 1
-                        _accumulate_terminal_payoffs(
-                            utilities_hashed[(seq_p, seq_b0, new_seq_b1)],
-                            valuation_prob,
-                            stage,
-                            v0,
-                            v1,
-                            bids0,
-                            new_bids1,
-                        )
                     else:
                         frames.append((
                             "P",
@@ -347,15 +336,6 @@ def discover_epbs_vanilla_direct(
             actions[0][infoset].add(0)
             children[0].setdefault((infoset, 0), OrderedSet())
             terminal_histories += 1
-            _accumulate_terminal_payoffs(
-                utilities_hashed[((infoset, 0), seq_b0, seq_b1)],
-                valuation_prob,
-                stage,
-                v0,
-                v1,
-                bids0,
-                bids1,
-            )
 
             for mask0 in _submasks(allowed_b0):
                 for mask1 in _submasks(allowed_b1):
@@ -379,7 +359,7 @@ def discover_epbs_vanilla_direct(
         "valuation_outcomes": int(valuation_outcomes),
         "expanded_frames": int(expanded_frames),
         "terminal_histories": int(terminal_histories),
-        "utility_profiles": int(len(utilities_hashed)),
+        "utility_profiles": 0,
     }
 
     return DirectCompilerDiscovery(
@@ -388,6 +368,262 @@ def discover_epbs_vanilla_direct(
         actions=actions,
         infoset_order=infoset_order,
         infoset_labels=infoset_labels,
-        utilities_hashed=utilities_hashed,
+        utilities_hashed=defaultdict(lambda: np.zeros(player_count, dtype=np.float32)),
         stats=stats,
     )
+
+
+def emit_epbs_vanilla_direct_rows(
+    game: Any,
+    *,
+    state_key_from_infoset: Callable[[int, str], Any],
+    external_sequence_index: list[dict[tuple, int]],
+    emit_row: Callable[[list[int], np.ndarray], None],
+) -> None:
+    reason = direct_compiler_eligibility_reason(game)
+    if reason is not None:
+        raise ValueError(reason)
+
+    player_count = int(game.num_players())
+    num_builders = int(game.num_builders)
+    nv = int(game.Nv)
+    num_stages = int(game.num_stages)
+    latency = tuple(int(x) for x in game.latency)
+    value_levels = tuple(float(x) for x in game.value_levels)
+    bid_levels = tuple(float(x) for x in game.bid_levels)
+    max_bid_index_by_value = tuple(int(x) for x in game.max_bid_index_by_value)
+    k_t = tuple(float(x) for x in game.k_t)
+    message_mask_bound = int(game.message_mask_bound)
+    raw_dist = getattr(game, "valuation_dist", None)
+
+    if raw_dist is None:
+        valuation_dist = tuple(
+            1.0 / float(nv ** num_builders)
+            for _ in range(nv ** num_builders)
+        )
+    else:
+        valuation_dist = tuple(float(x) for x in raw_dist)
+
+    def _submasks(mask: int):
+        submask = int(mask)
+        while True:
+            yield submask
+            if submask == 0:
+                break
+            submask = (submask - 1) & int(mask)
+
+    def _encode_message_pair(mask1: int, mask2: int) -> int:
+        return 1 + int(mask1) * message_mask_bound + int(mask2)
+
+    def _delivered_mask(receiver_idx: int, stage: int, message_masks: tuple[int, ...]) -> int:
+        delivered_count = max(0, int(stage) - int(latency[receiver_idx]))
+        delivered_count = min(delivered_count, len(message_masks))
+        mask = 0
+        for sent_mask in message_masks[:delivered_count]:
+            mask |= int(sent_mask)
+        return mask
+
+    def _known_opponent_bids(
+        receiver_idx: int,
+        stage: int,
+        bids0: tuple[int, ...],
+        bids1: tuple[int, ...],
+        msg0: tuple[int, ...],
+        msg1: tuple[int, ...],
+    ) -> list[int]:
+        opponent_idx = 1 - int(receiver_idx)
+        delivered_mask = _delivered_mask(receiver_idx, stage, msg0 if receiver_idx == 0 else msg1)
+        opponent_bids = bids1 if opponent_idx == 1 else bids0
+        known: list[int] = []
+        for stage_no in range(1, num_stages + 1):
+            if delivered_mask & (1 << (stage_no - 1)):
+                if len(opponent_bids) >= stage_no:
+                    known.append(int(opponent_bids[stage_no - 1]))
+                else:
+                    known.append(-1)
+            else:
+                known.append(-1)
+        return known
+
+    def _proposer_infoset_string(
+        stage: int,
+        bids0: tuple[int, ...],
+        bids1: tuple[int, ...],
+        msg0: tuple[int, ...],
+        msg1: tuple[int, ...],
+    ) -> str:
+        bids_enc = ";".join(
+            (
+                f"0:{','.join(map(str, bids0))}",
+                f"1:{','.join(map(str, bids1))}",
+            ),
+        )
+        msg_enc = ";".join(
+            (
+                f"0:{','.join(map(str, msg0))}",
+                f"1:{','.join(map(str, msg1))}",
+            ),
+        )
+        return f"P|stage:{int(stage)}|phase:PROPOSER|bids:[{bids_enc}]|m:[{msg_enc}]"
+
+    def _builder_infoset_string(
+        builder_idx: int,
+        value_idx: int,
+        stage: int,
+        bids0: tuple[int, ...],
+        bids1: tuple[int, ...],
+        msg0: tuple[int, ...],
+        msg1: tuple[int, ...],
+    ) -> str:
+        own_bids = bids0 if builder_idx == 0 else bids1
+        known = _known_opponent_bids(builder_idx, stage, bids0, bids1, msg0, msg1)
+        known_enc = ",".join("?" if bid < 0 else str(bid) for bid in known)
+        delivered_mask = _delivered_mask(builder_idx, stage, msg0 if builder_idx == 0 else msg1)
+        return (
+            f"B{int(builder_idx)}|v:{int(value_idx)}|stage:{int(stage)}"
+            f"|b:[{','.join(map(str, own_bids))}]|opp:[{known_enc}]|d:{int(delivered_mask)}"
+        )
+
+    def _legal_builder_actions(value_idx: int, own_bids: tuple[int, ...]) -> range:
+        prev_bid = int(own_bids[-1]) if own_bids else 0
+        max_bid = int(max_bid_index_by_value[int(value_idx)])
+        if prev_bid > max_bid:
+            raise ValueError("Previous bid exceeds valuation cap")
+        return range(prev_bid, max_bid + 1)
+
+    def _receiver_has_time_to_use_message(receiver_idx: int, stage: int) -> bool:
+        return int(stage) + int(latency[receiver_idx]) <= num_stages
+
+    def _scheduled_mask(message_masks: tuple[int, ...]) -> int:
+        mask = 0
+        for sent_mask in message_masks:
+            mask |= int(sent_mask)
+        return mask
+
+    def _available_reveal_mask(receiver_idx: int, stage: int, message_masks: tuple[int, ...]) -> int:
+        if not _receiver_has_time_to_use_message(receiver_idx, stage):
+            return 0
+        upto_stage_mask = (1 << int(stage)) - 1
+        return upto_stage_mask & ~_scheduled_mask(message_masks)
+
+    def _terminal_payoffs(
+        valuation_prob: float,
+        terminal_stage: int,
+        v0: int,
+        v1: int,
+        bids0: tuple[int, ...],
+        bids1: tuple[int, ...],
+    ) -> np.ndarray:
+        acc = np.zeros(player_count, dtype=np.float32)
+        stage_idx = int(terminal_stage) - 1
+        stage_bids = (int(bids0[stage_idx]), int(bids1[stage_idx]))
+        stage_bid_vals = (bid_levels[stage_bids[0]], bid_levels[stage_bids[1]])
+        val_vals = (value_levels[int(v0)], value_levels[int(v1)])
+
+        max_bid = max(stage_bids)
+        winners = [idx for idx, bid in enumerate(stage_bids) if bid == max_bid]
+        scale = float(valuation_prob) * float(k_t[stage_idx])
+
+        acc[0] += scale * float(max(stage_bid_vals))
+        if len(winners) == 1:
+            winner = winners[0]
+            acc[1 + winner] += scale * float(val_vals[winner] - stage_bid_vals[winner])
+        else:
+            split = float(len(winners))
+            for winner in winners:
+                acc[1 + winner] += scale * float(val_vals[winner] - stage_bid_vals[winner]) / split
+        return acc
+
+    valuation_outcomes = nv ** num_builders
+    for valuation_action in range(valuation_outcomes):
+        valuation_prob = float(valuation_dist[valuation_action])
+        remaining = int(valuation_action)
+        v1 = remaining % nv
+        remaining //= nv
+        v0 = remaining % nv
+
+        stack: list[tuple[str, int, tuple[int, ...], tuple[int, ...], tuple[int, ...], tuple[int, ...], tuple, tuple, tuple]] = [
+            ("B0", 1, (), (), (), (), (), (), ()),
+        ]
+        while stack:
+            phase, stage, bids0, bids1, msg0, msg1, seq_p, seq_b0, seq_b1 = stack.pop()
+
+            if phase == "B0":
+                infoset = state_key_from_infoset(1, _builder_infoset_string(0, v0, stage, bids0, bids1, msg0, msg1))
+                frames: list[tuple[str, int, tuple[int, ...], tuple[int, ...], tuple[int, ...], tuple[int, ...], tuple, tuple, tuple]] = []
+                for action0 in _legal_builder_actions(v0, bids0):
+                    action0 = int(action0)
+                    frames.append((
+                        "B1",
+                        stage,
+                        bids0 + (action0,),
+                        bids1,
+                        msg0,
+                        msg1,
+                        seq_p,
+                        (infoset, action0),
+                        seq_b1,
+                    ))
+                stack.extend(reversed(frames))
+                continue
+
+            if phase == "B1":
+                infoset = state_key_from_infoset(2, _builder_infoset_string(1, v1, stage, bids0, bids1, msg0, msg1))
+                frames = []
+                for action1 in _legal_builder_actions(v1, bids1):
+                    action1 = int(action1)
+                    new_seq_b1 = (infoset, action1)
+                    new_bids1 = bids1 + (action1,)
+
+                    if stage == num_stages:
+                        coords_row = [
+                            int(external_sequence_index[0][seq_p]),
+                            int(external_sequence_index[1][seq_b0]),
+                            int(external_sequence_index[2][new_seq_b1]),
+                        ]
+                        emit_row(coords_row, _terminal_payoffs(valuation_prob, stage, v0, v1, bids0, new_bids1))
+                    else:
+                        frames.append((
+                            "P",
+                            stage,
+                            bids0,
+                            new_bids1,
+                            msg0,
+                            msg1,
+                            seq_p,
+                            seq_b0,
+                            new_seq_b1,
+                        ))
+                stack.extend(reversed(frames))
+                continue
+
+            if phase != "P":
+                raise ValueError(f"unsupported phase {phase!r}")
+
+            infoset = state_key_from_infoset(0, _proposer_infoset_string(stage, bids0, bids1, msg0, msg1))
+            allowed_b0 = _available_reveal_mask(0, stage, msg0)
+            allowed_b1 = _available_reveal_mask(1, stage, msg1)
+
+            coords_row = [
+                int(external_sequence_index[0][(infoset, 0)]),
+                int(external_sequence_index[1][seq_b0]),
+                int(external_sequence_index[2][seq_b1]),
+            ]
+            emit_row(coords_row, _terminal_payoffs(valuation_prob, stage, v0, v1, bids0, bids1))
+
+            frames = []
+            for mask0 in _submasks(allowed_b0):
+                for mask1 in _submasks(allowed_b1):
+                    action = _encode_message_pair(mask0, mask1)
+                    frames.append((
+                        "B0",
+                        stage + 1,
+                        bids0,
+                        bids1,
+                        msg0 + (int(mask0),),
+                        msg1 + (int(mask1),),
+                        (infoset, action),
+                        seq_b0,
+                        seq_b1,
+                    ))
+            stack.extend(reversed(frames))

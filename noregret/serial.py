@@ -13,7 +13,7 @@ from pathlib import Path
 import pickle
 from random import choices
 import threading
-from typing import Any
+from typing import Any, Callable
 
 from ordered_set import OrderedSet
 import numpy as np
@@ -23,11 +23,13 @@ from noregret.epbs_vanilla_compiler import (
     can_direct_compile_epbs_vanilla,
     direct_compiler_eligibility_reason as epbs_vanilla_direct_compiler_eligibility_reason,
     discover_epbs_vanilla_direct,
+    emit_epbs_vanilla_direct_rows,
 )
 from noregret.pbs_passive_compiler import (
     can_direct_compile_pbs_passive,
     direct_compiler_eligibility_reason,
     discover_pbs_passive_direct,
+    emit_pbs_passive_direct_rows,
 )
 from noregret.utilities import *
 from pyspiel import GameType, SpielError
@@ -132,6 +134,25 @@ class _InMemoryProfilePerPlayerRowSink(_ProfilePerPlayerRowSink):
             'coords': coords,
             'values': payloads,
         }
+
+
+@dataclass
+class _BuiltDecisionProcesses:
+    tfsdps: list[TreeFormSequentialDecisionProcess]
+    raw_tfsdps: list[Any]
+    external_sequence_index: list[dict[tuple, int]]
+
+
+def _sort_profile_per_player_packed_utilities(raw_utilities: dict[str, Any]) -> dict[str, Any]:
+    coords = np.asarray(raw_utilities['coords'])
+    if coords.ndim != 2 or coords.shape[0] <= 1:
+        return raw_utilities
+
+    order = np.lexsort(tuple(coords[:, col] for col in range(coords.shape[1] - 1, -1, -1)))
+    raw_utilities['coords'] = coords[order]
+    for payload in raw_utilities['values']:
+        payload['data'] = np.asarray(payload['data'])[order]
+    return raw_utilities
 
 
 def _make_state_key_from_infoset(
@@ -285,25 +306,17 @@ def _discover_game_via_state_dfs(
     }
 
 
-def _build_raw_game_from_discovery(
-    game: Any,
+def _build_decision_processes_from_discovery(
     *,
-    player_count: int,
     children: list[dict[tuple, OrderedSet]],
     actions: list[dict[Any, OrderedSet]],
-    infoset_order: list[list[Any]],
-    infoset_labels: list[dict[Any, str]],
-    utilities_hashed: defaultdict[tuple, np.ndarray],
-    emit_policy_specs: bool,
-    hash_digest_size: int,
-    hash_infosets: bool,
-    check_hash_collisions: bool,
-    sort_utilities: bool,
     debug: bool,
-) -> dict[str, Any]:
-    decision_ids: list[dict[int, int]] = []
-    action_event_ids: list[dict[int, dict[int, int]]] = []
+) -> _BuiltDecisionProcesses:
+    player_count = len(actions)
+    decision_ids: list[dict[Any, int]] = []
+    action_event_ids: list[dict[Any, dict[int, int]]] = []
     tfsdps: list[TreeFormSequentialDecisionProcess] = []
+    external_sequence_index: list[dict[tuple, int]] = []
 
     for p in range(player_count):
         children_map = children[p]
@@ -311,7 +324,7 @@ def _build_raw_game_from_discovery(
         infosets = list(actions_map.keys())
         decision_id = {h: i for i, h in enumerate(infosets)}
 
-        action_event_id: dict[int, dict[int, int]] = {}
+        action_event_id: dict[Any, dict[int, int]] = {}
         for h in infosets:
             ordered_actions = list(actions_map.get(h, OrderedSet()))
             action_event_id[h] = {a: i for i, a in enumerate(ordered_actions)}
@@ -375,13 +388,24 @@ def _build_raw_game_from_discovery(
         transitions[()] = _target_node(())
         _expand_from_root()
 
-        tfsdps.append(TreeFormSequentialDecisionProcess(transitions, node_types))
+        tfsdp = TreeFormSequentialDecisionProcess(transitions, node_types)
+        tfsdps.append(tfsdp)
         decision_ids.append(decision_id)
         action_event_ids.append(action_event_id)
         children_map.clear()
 
+        seq_index = {seq: i for i, seq in enumerate(tfsdp.sequences)}
+        ext_index: dict[tuple, int] = {(): int(seq_index[()])}
+        for h in infosets:
+            for action in actions_map.get(h, OrderedSet()):
+                ext_seq = (h, int(action))
+                nid = decision_id[h]
+                eid = action_event_id[h][int(action)]
+                ext_index[ext_seq] = int(seq_index[(nid, eid)])
+        external_sequence_index.append(ext_index)
+
         try:
-            seq_count = len(tfsdps[-1].sequences)
+            seq_count = len(tfsdp.sequences)
         except Exception:
             seq_count = 'NA'
         obs_count = sum(
@@ -399,31 +423,99 @@ def _build_raw_game_from_discovery(
             transitions=int(len(transitions)),
         )
 
+    return _BuiltDecisionProcesses(
+        tfsdps=tfsdps,
+        raw_tfsdps=[t.to_list() for t in tfsdps],
+        external_sequence_index=external_sequence_index,
+    )
+
+
+def _assemble_raw_game(
+    *,
+    raw_tfsdps: list[Any],
+    raw_utilities: Any,
+    player_count: int,
+    infoset_order: list[list[Any]],
+    infoset_labels: list[dict[Any, str]],
+    actions: list[dict[Any, OrderedSet]],
+    emit_policy_specs: bool,
+    hash_digest_size: int,
+    hash_infosets: bool,
+    check_hash_collisions: bool,
+    sort_utilities: bool,
+    zero_sum: bool,
+) -> dict[str, Any]:
+    raw_game = {
+        'tree_form_sequential_decision_processes': raw_tfsdps,
+        'utilities': raw_utilities,
+        'meta': {
+            'format': 'nogret.openspiel.game.per_agent',
+            'version': 5 if emit_policy_specs else 4,
+            'player_count': player_count,
+            'hash_digest_size': hash_digest_size,
+            'hash_infosets': bool(hash_infosets),
+            'check_hash_collisions': bool(check_hash_collisions),
+            'sort_utilities': bool(sort_utilities),
+            'zero_sum': bool(zero_sum),
+            'emit_policy_specs': bool(emit_policy_specs),
+        },
+    }
+    if emit_policy_specs:
+        raw_game['policy_specs'] = [
+            {
+                'infosets': [
+                    infoset_labels[p][infoset]
+                    for infoset in infoset_order[p]
+                ],
+                'actions': [
+                    list(actions[p].get(infoset, OrderedSet()))
+                    for infoset in infoset_order[p]
+                ],
+            }
+            for p in range(player_count)
+        ]
+    return raw_game
+
+
+def _build_raw_game_from_discovery(
+    game: Any,
+    *,
+    player_count: int,
+    children: list[dict[tuple, OrderedSet]],
+    actions: list[dict[Any, OrderedSet]],
+    infoset_order: list[list[Any]],
+    infoset_labels: list[dict[Any, str]],
+    utilities_hashed: defaultdict[tuple, np.ndarray],
+    emit_policy_specs: bool,
+    hash_digest_size: int,
+    hash_infosets: bool,
+    check_hash_collisions: bool,
+    sort_utilities: bool,
+    debug: bool,
+) -> dict[str, Any]:
+    built = _build_decision_processes_from_discovery(
+        children=children,
+        actions=actions,
+        debug=bool(debug),
+    )
+
     utilities: defaultdict[tuple, np.ndarray] = defaultdict(
         lambda: np.zeros(player_count, dtype=np.float32),
     )
 
     for hashed_sequences, vals in utilities_hashed.items():
-        internal_sequences: list[tuple] = []
+        coords_row: list[int] = []
         for p, seq in enumerate(hashed_sequences):
-            if not seq:
-                internal_sequences.append(())
-                continue
-            infoset_key, action_id = seq
-            nid = decision_ids[p][infoset_key]
-            eid = action_event_ids[p][infoset_key][int(action_id)]
-            internal_sequences.append((nid, eid))
-
-        utilities[tuple(internal_sequences)] += vals
+            ext_seq = seq if seq else ()
+            coords_row.append(int(built.external_sequence_index[p][ext_seq]))
+        utilities[tuple(coords_row)] += vals
     utilities_hashed.clear()
-    decision_ids = []
-    action_event_ids = []
 
     _dprint(
         debug,
         'Utilities mapped to internal sequences',
         nonzero_profiles=int(len(utilities)),
-        shape=tuple(int(x) for x in (tuple(len(t.sequences) for t in tfsdps))),
+        shape=tuple(int(len(t.sequences)) for t in built.tfsdps),
     )
 
     zero_sum = (
@@ -432,11 +524,7 @@ def _build_raw_game_from_discovery(
     )
 
     raw_utilities: Any
-    shape = tuple(len(t.sequences) for t in tfsdps)
-    seq_index = [
-        {seq: i for i, seq in enumerate(t.sequences)}
-        for t in tfsdps
-    ]
+    shape = tuple(len(t.sequences) for t in built.tfsdps)
 
     def _pack_csr_parts(
             *,
@@ -468,9 +556,9 @@ def _build_raw_game_from_discovery(
         cols = np.empty(nnz, dtype=np.int64)
         data = np.empty(nnz, dtype=np.float32)
 
-        for k, ((s0, s1), vals) in enumerate(utilities.items()):
-            rows[k] = int(seq_index[0][s0])
-            cols[k] = int(seq_index[1][s1])
+        for k, ((c0, c1), vals) in enumerate(utilities.items()):
+            rows[k] = int(c0)
+            cols[k] = int(c1)
             data[k] = np.float32(vals[0])
         utilities.clear()
 
@@ -507,8 +595,7 @@ def _build_raw_game_from_discovery(
             value_dtype=np.float32,
         )
 
-        for seqs, vals in items:
-            coords_row = [int(seq_index[p][seqs[p]]) for p in range(player_count)]
+        for coords_row, vals in items:
             row_sink.append(coords_row, np.asarray(vals, dtype=np.float32))
         utilities.clear()
         if sort_utilities:
@@ -523,39 +610,81 @@ def _build_raw_game_from_discovery(
             coords_shape=tuple(int(x) for x in raw_utilities['coords'].shape),
             per_player_vec_nnz=nnz_each,
         )
+    return _assemble_raw_game(
+        raw_tfsdps=built.raw_tfsdps,
+        raw_utilities=raw_utilities,
+        player_count=player_count,
+        infoset_order=infoset_order,
+        infoset_labels=infoset_labels,
+        actions=actions,
+        emit_policy_specs=emit_policy_specs,
+        hash_digest_size=hash_digest_size,
+        hash_infosets=hash_infosets,
+        check_hash_collisions=check_hash_collisions,
+        sort_utilities=sort_utilities,
+        zero_sum=zero_sum,
+    )
 
-    raw_tfsdps = [t.to_list() for t in tfsdps]
-    raw_game = {
-        'tree_form_sequential_decision_processes': raw_tfsdps,
-        'utilities': raw_utilities,
-        'meta': {
-            'format': 'nogret.openspiel.game.per_agent',
-            'version': 5 if emit_policy_specs else 4,
-            'player_count': player_count,
-            'hash_digest_size': hash_digest_size,
-            'hash_infosets': bool(hash_infosets),
-            'check_hash_collisions': bool(check_hash_collisions),
-            'sort_utilities': bool(sort_utilities),
-            'zero_sum': bool(zero_sum),
-            'emit_policy_specs': bool(emit_policy_specs),
-        },
-    }
-    if emit_policy_specs:
-        raw_game['policy_specs'] = [
-            {
-                'infosets': [
-                    infoset_labels[p][infoset]
-                    for infoset in infoset_order[p]
-                ],
-                'actions': [
-                    list(actions[p].get(infoset, OrderedSet()))
-                    for infoset in infoset_order[p]
-                ],
-            }
-            for p in range(player_count)
-        ]
 
-    return raw_game
+def _build_raw_game_from_direct_rows(
+    game: Any,
+    *,
+    player_count: int,
+    children: list[dict[tuple, OrderedSet]],
+    actions: list[dict[Any, OrderedSet]],
+    infoset_order: list[list[Any]],
+    infoset_labels: list[dict[Any, str]],
+    emit_policy_specs: bool,
+    hash_digest_size: int,
+    hash_infosets: bool,
+    check_hash_collisions: bool,
+    sort_utilities: bool,
+    terminal_histories: int,
+    emit_direct_rows: Callable[[list[dict[tuple, int]], Callable[[list[int], np.ndarray], None]], None],
+    debug: bool,
+) -> dict[str, Any]:
+    built = _build_decision_processes_from_discovery(
+        children=children,
+        actions=actions,
+        debug=bool(debug),
+    )
+
+    row_sink = _InMemoryProfilePerPlayerRowSink(
+        row_count=int(terminal_histories),
+        player_count=int(player_count),
+        coord_dtype=np.int64,
+        value_dtype=np.float32,
+    )
+    emit_direct_rows(
+        built.external_sequence_index,
+        row_sink.append,
+    )
+    raw_utilities = row_sink.finalize()
+    if sort_utilities:
+        raw_utilities = _sort_profile_per_player_packed_utilities(raw_utilities)
+
+    _dprint(
+        debug,
+        'Packed utilities (profile_per_player direct rows)',
+        nnz=int(raw_utilities['coords'].shape[0]),
+        coords_shape=tuple(int(x) for x in raw_utilities['coords'].shape),
+        per_player_vec_nnz=[int(raw_utilities['coords'].shape[0])] * int(player_count),
+    )
+
+    return _assemble_raw_game(
+        raw_tfsdps=built.raw_tfsdps,
+        raw_utilities=raw_utilities,
+        player_count=player_count,
+        infoset_order=infoset_order,
+        infoset_labels=infoset_labels,
+        actions=actions,
+        emit_policy_specs=emit_policy_specs,
+        hash_digest_size=hash_digest_size,
+        hash_infosets=hash_infosets,
+        check_hash_collisions=check_hash_collisions,
+        sort_utilities=sort_utilities,
+        zero_sum=False,
+    )
 
 
 
@@ -680,21 +809,66 @@ def persist_openspiel_game_per_agent(
             utility_profiles=stats.get('utility_profiles', 'NA'),
         )
 
-    raw_game = _build_raw_game_from_discovery(
-        game,
-        player_count=int(discovery['player_count']),
-        children=discovery['children'],
-        actions=discovery['actions'],
-        infoset_order=discovery['infoset_order'],
-        infoset_labels=discovery['infoset_labels'],
-        utilities_hashed=discovery['utilities_hashed'],
-        emit_policy_specs=bool(emit_policy_specs),
-        hash_digest_size=int(hash_digest_size),
-        hash_infosets=bool(hash_infosets),
-        check_hash_collisions=bool(check_hash_collisions),
-        sort_utilities=bool(sort_utilities),
-        debug=bool(debug),
-    )
+    if compiler_used == 'pbs_passive_direct':
+        raw_game = _build_raw_game_from_direct_rows(
+            game,
+            player_count=int(discovery['player_count']),
+            children=discovery['children'],
+            actions=discovery['actions'],
+            infoset_order=discovery['infoset_order'],
+            infoset_labels=discovery['infoset_labels'],
+            emit_policy_specs=bool(emit_policy_specs),
+            hash_digest_size=int(hash_digest_size),
+            hash_infosets=bool(hash_infosets),
+            check_hash_collisions=bool(check_hash_collisions),
+            sort_utilities=bool(sort_utilities),
+            terminal_histories=int(discovery.get('stats', {}).get('terminal_histories', 0)),
+            emit_direct_rows=lambda external_sequence_index, emit_row: emit_pbs_passive_direct_rows(
+                game,
+                state_key_from_infoset=state_key_from_infoset,
+                external_sequence_index=external_sequence_index,
+                emit_row=emit_row,
+            ),
+            debug=bool(debug),
+        )
+    elif compiler_used == 'epbs_vanilla_direct':
+        raw_game = _build_raw_game_from_direct_rows(
+            game,
+            player_count=int(discovery['player_count']),
+            children=discovery['children'],
+            actions=discovery['actions'],
+            infoset_order=discovery['infoset_order'],
+            infoset_labels=discovery['infoset_labels'],
+            emit_policy_specs=bool(emit_policy_specs),
+            hash_digest_size=int(hash_digest_size),
+            hash_infosets=bool(hash_infosets),
+            check_hash_collisions=bool(check_hash_collisions),
+            sort_utilities=bool(sort_utilities),
+            terminal_histories=int(discovery.get('stats', {}).get('terminal_histories', 0)),
+            emit_direct_rows=lambda external_sequence_index, emit_row: emit_epbs_vanilla_direct_rows(
+                game,
+                state_key_from_infoset=state_key_from_infoset,
+                external_sequence_index=external_sequence_index,
+                emit_row=emit_row,
+            ),
+            debug=bool(debug),
+        )
+    else:
+        raw_game = _build_raw_game_from_discovery(
+            game,
+            player_count=int(discovery['player_count']),
+            children=discovery['children'],
+            actions=discovery['actions'],
+            infoset_order=discovery['infoset_order'],
+            infoset_labels=discovery['infoset_labels'],
+            utilities_hashed=discovery['utilities_hashed'],
+            emit_policy_specs=bool(emit_policy_specs),
+            hash_digest_size=int(hash_digest_size),
+            hash_infosets=bool(hash_infosets),
+            check_hash_collisions=bool(check_hash_collisions),
+            sort_utilities=bool(sort_utilities),
+            debug=bool(debug),
+        )
     raw_game['meta']['compiler_requested'] = compiler_requested
     raw_game['meta']['compiler_used'] = compiler_used
     if compiler_fallback_reason is not None:
