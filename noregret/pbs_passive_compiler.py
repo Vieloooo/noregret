@@ -229,6 +229,7 @@ def emit_pbs_passive_direct_rows(
     state_key_from_infoset: Callable[[int, str], Any],
     external_sequence_index: list[dict[tuple, int]],
     emit_row: Callable[[list[int], np.ndarray], None],
+    debug: bool = False,
 ) -> None:
     reason = direct_compiler_eligibility_reason(game)
     if reason is not None:
@@ -303,12 +304,26 @@ def emit_pbs_passive_direct_rows(
         return acc
 
     valuation_outcomes = nv ** player_count
+    emitted_rows = 0
+    progress_every = max(1, valuation_outcomes // 20)
     for valuation_action in range(valuation_outcomes):
         valuation_prob = float(valuation_dist[valuation_action])
         remaining = int(valuation_action)
         v1 = remaining % nv
         remaining //= nv
         v0 = remaining % nv
+
+        if debug and (
+            valuation_action == 0
+            or valuation_action + 1 == valuation_outcomes
+            or (valuation_action + 1) % progress_every == 0
+        ):
+            print(
+                '[nogret.serial] Direct rows progress | '
+                f'game=pbs_passive valuation={valuation_action + 1}/{valuation_outcomes} '
+                f'emitted_rows={emitted_rows}',
+                flush=True,
+            )
 
         stack: list[tuple[int, int, tuple[int, ...], tuple[int, ...], tuple, tuple]] = [
             (1, 0, (), (), (), ()),
@@ -341,6 +356,7 @@ def emit_pbs_passive_direct_rows(
                         coords_row,
                         _terminal_payoffs(valuation_prob, v0, v1, bids0, new_bids1),
                     )
+                    emitted_rows += 1
                 else:
                     frames.append((stage + 1, 0, bids0, new_bids1, seq0, new_seq1))
             stack.extend(reversed(frames))

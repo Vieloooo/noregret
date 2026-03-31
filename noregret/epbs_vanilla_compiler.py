@@ -379,6 +379,7 @@ def emit_epbs_vanilla_direct_rows(
     state_key_from_infoset: Callable[[int, str], Any],
     external_sequence_index: list[dict[tuple, int]],
     emit_row: Callable[[list[int], np.ndarray], None],
+    debug: bool = False,
 ) -> None:
     reason = direct_compiler_eligibility_reason(game)
     if reason is not None:
@@ -535,12 +536,26 @@ def emit_epbs_vanilla_direct_rows(
         return acc
 
     valuation_outcomes = nv ** num_builders
+    emitted_rows = 0
+    progress_every = max(1, valuation_outcomes // 20)
     for valuation_action in range(valuation_outcomes):
         valuation_prob = float(valuation_dist[valuation_action])
         remaining = int(valuation_action)
         v1 = remaining % nv
         remaining //= nv
         v0 = remaining % nv
+
+        if debug and (
+            valuation_action == 0
+            or valuation_action + 1 == valuation_outcomes
+            or (valuation_action + 1) % progress_every == 0
+        ):
+            print(
+                '[nogret.serial] Direct rows progress | '
+                f'game=epbs_vanilla valuation={valuation_action + 1}/{valuation_outcomes} '
+                f'emitted_rows={emitted_rows}',
+                flush=True,
+            )
 
         stack: list[tuple[str, int, tuple[int, ...], tuple[int, ...], tuple[int, ...], tuple[int, ...], tuple, tuple, tuple]] = [
             ("B0", 1, (), (), (), (), (), (), ()),
@@ -582,6 +597,7 @@ def emit_epbs_vanilla_direct_rows(
                             int(external_sequence_index[2][new_seq_b1]),
                         ]
                         emit_row(coords_row, _terminal_payoffs(valuation_prob, stage, v0, v1, bids0, new_bids1))
+                        emitted_rows += 1
                     else:
                         frames.append((
                             "P",
@@ -610,6 +626,7 @@ def emit_epbs_vanilla_direct_rows(
                 int(external_sequence_index[2][seq_b1]),
             ]
             emit_row(coords_row, _terminal_payoffs(valuation_prob, stage, v0, v1, bids0, bids1))
+            emitted_rows += 1
 
             frames = []
             for mask0 in _submasks(allowed_b0):

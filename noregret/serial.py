@@ -312,6 +312,7 @@ def _build_decision_processes_from_discovery(
     actions: list[dict[Any, OrderedSet]],
     debug: bool,
 ) -> _BuiltDecisionProcesses:
+    _dprint(debug, 'Build decision processes: start', player_count=int(len(actions)))
     player_count = len(actions)
     decision_ids: list[dict[Any, int]] = []
     action_event_ids: list[dict[Any, dict[int, int]]] = []
@@ -493,6 +494,13 @@ def _build_raw_game_from_discovery(
     sort_utilities: bool,
     debug: bool,
 ) -> dict[str, Any]:
+    _dprint(
+        debug,
+        'Build raw game from discovery: start',
+        player_count=int(player_count),
+        emit_policy_specs=bool(emit_policy_specs),
+        sort_utilities=bool(sort_utilities),
+    )
     built = _build_decision_processes_from_discovery(
         children=children,
         actions=actions,
@@ -510,6 +518,7 @@ def _build_raw_game_from_discovery(
             coords_row.append(int(built.external_sequence_index[p][ext_seq]))
         utilities[tuple(coords_row)] += vals
     utilities_hashed.clear()
+    _dprint(debug, 'Build raw game from discovery: remap complete')
 
     _dprint(
         debug,
@@ -610,6 +619,7 @@ def _build_raw_game_from_discovery(
             coords_shape=tuple(int(x) for x in raw_utilities['coords'].shape),
             per_player_vec_nnz=nnz_each,
         )
+    _dprint(debug, 'Build raw game from discovery: assemble bundle')
     return _assemble_raw_game(
         raw_tfsdps=built.raw_tfsdps,
         raw_utilities=raw_utilities,
@@ -643,6 +653,14 @@ def _build_raw_game_from_direct_rows(
     emit_direct_rows: Callable[[list[dict[tuple, int]], Callable[[list[int], np.ndarray], None]], None],
     debug: bool,
 ) -> dict[str, Any]:
+    _dprint(
+        debug,
+        'Build raw game from direct rows: start',
+        player_count=int(player_count),
+        terminal_histories=int(terminal_histories),
+        emit_policy_specs=bool(emit_policy_specs),
+        sort_utilities=bool(sort_utilities),
+    )
     built = _build_decision_processes_from_discovery(
         children=children,
         actions=actions,
@@ -659,9 +677,11 @@ def _build_raw_game_from_direct_rows(
         built.external_sequence_index,
         row_sink.append,
     )
+    _dprint(debug, 'Build raw game from direct rows: row emission complete')
     raw_utilities = row_sink.finalize()
     if sort_utilities:
         raw_utilities = _sort_profile_per_player_packed_utilities(raw_utilities)
+        _dprint(debug, 'Build raw game from direct rows: sorted packed rows')
 
     _dprint(
         debug,
@@ -671,6 +691,7 @@ def _build_raw_game_from_direct_rows(
         per_player_vec_nnz=[int(raw_utilities['coords'].shape[0])] * int(player_count),
     )
 
+    _dprint(debug, 'Build raw game from direct rows: assemble bundle')
     return _assemble_raw_game(
         raw_tfsdps=built.raw_tfsdps,
         raw_utilities=raw_utilities,
@@ -752,6 +773,7 @@ def persist_openspiel_game_per_agent(
         raise ValueError(f'unsupported compiler mode: {compiler_requested!r}')
 
     if compiler_requested == 'dfs':
+        _dprint(debug, 'Serializer step: discover via DFS')
         discovery = _discover_game_via_state_dfs(
             game,
             emit_policy_specs=bool(emit_policy_specs),
@@ -759,6 +781,7 @@ def persist_openspiel_game_per_agent(
             debug=bool(debug),
         )
     elif compiler_requested == 'pbs_passive_direct':
+        _dprint(debug, 'Serializer step: discover via pbs_passive_direct')
         discovery = discover_pbs_passive_direct(
             game,
             emit_policy_specs=bool(emit_policy_specs),
@@ -766,6 +789,7 @@ def persist_openspiel_game_per_agent(
         ).__dict__
         compiler_used = 'pbs_passive_direct'
     elif compiler_requested == 'epbs_vanilla_direct':
+        _dprint(debug, 'Serializer step: discover via epbs_vanilla_direct')
         discovery = discover_epbs_vanilla_direct(
             game,
             emit_policy_specs=bool(emit_policy_specs),
@@ -774,6 +798,7 @@ def persist_openspiel_game_per_agent(
         compiler_used = 'epbs_vanilla_direct'
     else:
         if can_direct_compile_pbs_passive(game):
+            _dprint(debug, 'Serializer step: auto selected pbs_passive_direct')
             discovery = discover_pbs_passive_direct(
                 game,
                 emit_policy_specs=bool(emit_policy_specs),
@@ -781,6 +806,7 @@ def persist_openspiel_game_per_agent(
             ).__dict__
             compiler_used = 'pbs_passive_direct'
         elif can_direct_compile_epbs_vanilla(game):
+            _dprint(debug, 'Serializer step: auto selected epbs_vanilla_direct')
             discovery = discover_epbs_vanilla_direct(
                 game,
                 emit_policy_specs=bool(emit_policy_specs),
@@ -788,6 +814,7 @@ def persist_openspiel_game_per_agent(
             ).__dict__
             compiler_used = 'epbs_vanilla_direct'
         else:
+            _dprint(debug, 'Serializer step: auto falling back to DFS')
             pbs_reason = direct_compiler_eligibility_reason(game)
             epbs_reason = epbs_vanilla_direct_compiler_eligibility_reason(game)
             compiler_fallback_reason = epbs_reason if epbs_reason is not None and pbs_reason and "unsupported game short_name" in pbs_reason else pbs_reason
@@ -810,6 +837,7 @@ def persist_openspiel_game_per_agent(
         )
 
     if compiler_used == 'pbs_passive_direct':
+        _dprint(debug, 'Serializer step: build packed bundle from pbs_passive direct rows')
         raw_game = _build_raw_game_from_direct_rows(
             game,
             player_count=int(discovery['player_count']),
@@ -828,10 +856,12 @@ def persist_openspiel_game_per_agent(
                 state_key_from_infoset=state_key_from_infoset,
                 external_sequence_index=external_sequence_index,
                 emit_row=emit_row,
+                debug=bool(debug),
             ),
             debug=bool(debug),
         )
     elif compiler_used == 'epbs_vanilla_direct':
+        _dprint(debug, 'Serializer step: build packed bundle from epbs_vanilla direct rows')
         raw_game = _build_raw_game_from_direct_rows(
             game,
             player_count=int(discovery['player_count']),
@@ -850,10 +880,12 @@ def persist_openspiel_game_per_agent(
                 state_key_from_infoset=state_key_from_infoset,
                 external_sequence_index=external_sequence_index,
                 emit_row=emit_row,
+                debug=bool(debug),
             ),
             debug=bool(debug),
         )
     else:
+        _dprint(debug, 'Serializer step: build packed bundle from discovery utilities')
         raw_game = _build_raw_game_from_discovery(
             game,
             player_count=int(discovery['player_count']),
@@ -879,6 +911,7 @@ def persist_openspiel_game_per_agent(
     out_file = out_path / f'{file_prefix}{suffix}'
     tmp = out_file.with_suffix(out_file.suffix + '.tmp')
 
+    _dprint(debug, 'Serializer step: write bundle to disk', tmp_file=str(tmp), compress=bool(compress))
     if compress:
         with gzip.open(tmp, 'wb', compresslevel=1) as f:
             pickle.dump(raw_game, f, protocol=pickle.HIGHEST_PROTOCOL)
@@ -886,6 +919,7 @@ def persist_openspiel_game_per_agent(
         with open(tmp, 'wb') as f:
             pickle.dump(raw_game, f, protocol=pickle.HIGHEST_PROTOCOL)
     os.replace(tmp, out_file)
+    _dprint(debug, 'Serializer step: finalize output file', out_file=str(out_file))
 
     try:
         size_b = out_file.stat().st_size
